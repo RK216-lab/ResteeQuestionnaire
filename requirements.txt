@@ -1,3 +1,8 @@
 streamlit
 audio-recorder-streamlit
+openai-whisper
+opensmile
+sentence-transformers
+lightgbm
+scikit-learn
 requests
