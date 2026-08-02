@@ -1,8 +1,11 @@
 streamlit
-audio-recorder-streamlit
-openai-whisper
-opensmile
-sentence-transformers
-lightgbm
+numpy
+pandas
 scikit-learn
-requests
+lightgbm
+joblib
+sentence-transformers
+faster-whisper
+opensmile
+huggingface_hub
+torch
