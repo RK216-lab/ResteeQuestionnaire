@@ -6,6 +6,7 @@ import time
 import tempfile
 import gc
 import hashlib
+import random
 from datetime import datetime
 from typing import Dict, Optional, List, Any
 
@@ -28,10 +29,11 @@ HF_TOKEN = os.environ.get("HF_TOKEN", "")
 REPO_ID = os.environ.get("REPO_ID", "")
 DATA_DIR = "data_store"
 MODEL_DIR = "models"
+HISTORY_DIR = os.path.join(DATA_DIR, "history")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
+os.makedirs(HISTORY_DIR, exist_ok=True)
 
-# Parquet のみで運用（軽量・高速）
 DATA_PARQUET = os.path.join(DATA_DIR, "dataset.parquet")
 
 FEATURE_FILE = os.path.join(MODEL_DIR, "feature_columns.json")
@@ -39,7 +41,6 @@ PCA_FILE = os.path.join(MODEL_DIR, "pca.pkl")
 SCALER_FILE = os.path.join(MODEL_DIR, "scaler.pkl")
 METADATA_FILE = os.path.join(MODEL_DIR, "metadata.json")
 
-# Memory thresholds (MB)
 MEMORY_THRESHOLD_WARN = int(os.environ.get("MEM_WARN_MB", 2200))
 MEMORY_THRESHOLD_CRITICAL = int(os.environ.get("MEM_CRIT_MB", 2500))
 
@@ -50,9 +51,11 @@ MODEL_CONFIG = {
 }
 
 OPENSMILE_VALID_RATIO = float(os.environ.get("OPENSMILE_VALID_RATIO", 0.6))
-
-# DEBUG モードフラグ
 DEBUG = os.getenv("DEBUG", "0") == "1"
+
+# random.seed 管理
+RANDOM_SEED = int(os.environ.get("RANDOM_SEED", "42"))
+random.seed(RANDOM_SEED)
 
 try:
     import psutil
@@ -61,7 +64,7 @@ except Exception:
     HAS_PSUTIL = False
 
 # -------------------------
-# 品質統計カウンター（デバッグ用）
+# 品質統計
 # -------------------------
 QUALITY_STATS = {
     "total_attempts": 0,
@@ -115,14 +118,8 @@ def log_memory(label: str):
         return mem_mb
     return None
 
-def embed_to_json(arr: Any) -> str:
-    if arr is None: return "[]"
-    if isinstance(arr, np.ndarray):
-        return json.dumps(arr.astype(float).tolist(), ensure_ascii=False)
-    return "[]"
-
 # -------------------------
-# モデル / ライブラリの遅延ロード
+# モデル / ライブラリ
 # -------------------------
 @st.cache_resource
 def get_whisper_model_safe():
@@ -205,13 +202,32 @@ def load_metadata_safe():
     return None
 
 # -------------------------
-# 参考文書 embedding
+# Janome 形態素解析（OpenSMILE 失敗時）
+# -------------------------
+def get_word_count_janome(text: str) -> int:
+    """Janome で形態素解析して単語数取得"""
+    try:
+        from janome.tokenizer import Tokenizer
+        tokenizer = Tokenizer()
+        tokens = list(tokenizer.tokenize(text))
+        # 名詞・動詞・形容詞のみカウント
+        content_words = [t for t in tokens if t.part_of_speech.split(',')[0] in ['名詞', '動詞', '形容詞']]
+        return len(content_words)
+    except Exception:
+        # Janome が使えない場合はスペース区切り
+        return len(text.split())
+
+# -------------------------
+# 参考文書（症状のみ）
 # -------------------------
 REFERENCE_DOCS = {
-    "body": "passage: 身体的疲労。体がだるい、重い、筋肉に力が入らない、へとへと、動きたくない、休みたい。",
-    "brain": "passage: 認知の疲労（脳疲労）。頭がぼーっとする、集中できない、考えがまとまらない、ミスが増える。",
-    "mental": "passage: 精神的疲労。やる気が出ない、気力がない、イライラする、不安、人と話したくない、心が疲れた。",
-    "healthy": "passage: 健康で活力のある状態。体が軽い、元気いっぱい、すっきり、よく眠れた、集中できる、前向き。",
+    "body": """passage: 身体的疲労とは、筋肉や全身のだるさ、重さ、倦怠感を指します。典型的な症状として、体が鉛のように重い、階段を上がるのがつらい、立っているだけで疲れる、肩や腰がこる、休んでも疲れが取れない、朝起きるのがつらい、手足に力が入りにくい、歩く速度が遅くなる、筋肉が張りつめる、動作がゆっくりになる、体がだるくて動きたくない、重いものを持つのがつらい、長時間立っていられない、階段を使うのを避けたい、関節が重く感じる、全身に倦怠感がある、体を動かすのがおっくう、疲れが蓄積している感じがする、などがあります。""",
+    
+    "brain": """passage: 脳疲労（認知疲労）とは、頭がぼーっとする、集中力が続かない、考えがまとまらない、ミスが増える、判断が遅くなる、記憶力が落ちた気がする、読んでも内容が入ってこない、単純な計算で間違える、注意力が散漫、アイデアが浮かびにくい、思考がクリアではない、物事を考えるのが面倒、頭を使う作業を避けたい、記憶を思い出すのが大変、複数の作業ができない、指示を覚えるのが難しい、判断を誤ることが多い、などがあります。""",
+    
+    "mental": """passage: 精神的疲労とは、やる気が出ない、気力がわかない、イライラする、不安を感じる、人と話したくない、心が疲れた、悲しい気持ちになる、未来が憂鬱、自分を責めてしまう、感情が不安定、何にも興味がわかない、楽しくない、孤独を感じる、プレッシャーを感じる、焦りを感じる、心がざわざわする、気分が落ち込む、自分に自信が持てない、休みたいと思うことが多い、横になりたい、何をするにも時間がかかる、朝から気分が重い、などがあります。""",
+    
+    "healthy": """passage: 健康で活力のある状態とは、体が軽く元気いっぱい、頭がすっきり集中できる、心が安定して前向き、よく眠れた、よく食べられた、朝すっきり起きられる、日中活動的、物事に興味がある、人との交流を楽しめる、未来に希望がある、などがあります。""",
 }
 REFERENCE_CATS = ["body", "brain", "mental", "healthy"]
 
@@ -227,44 +243,138 @@ def get_reference_embeddings_safe():
         return None
 
 # -------------------------
-# 質問プール（各カテゴリ 2 問）
+# 質問プール（重複削除・60 問×3 カテゴリ）
 # -------------------------
 QUESTION_POOL = {
     "body": [
-        "今日は体がだるくて重いです", "筋肉に力が入らない感じがあります",
-        "動きたくないくらい疲れています", "階段を上がるのがつらいです",
-        "立っているだけで疲れます", "体が重いと感じます",
-        "肩や腰がこっています", "全身が疲れ切っています"
+        "階段を上がるのがつらく感じます", "立っているだけで疲れてきます",
+        "肩や腰がこって重いです", "体が鉛のように重く感じます",
+        "休んでも疲れが取れません", "朝起きるのがつらいです",
+        "手足に力が入りにくいです", "歩く速度が遅くなったと感じます",
+        "筋肉が張りつめた感じです", "動作がゆっくりになります",
+        "体がだるくて動きたくないです", "重いものを持つのがつらいです",
+        "長時間立っていられません", "階段を使うのを避けたくなります",
+        "関節が重く感じます", "全身に倦怠感があります",
+        "体を動かすのがおっくうです", "疲れが蓄積している感じです",
+        "朝から体が重いです", "横になりたいと思います",
+        "休みたいと思うことが多いです", "何をするにも時間がかかります",
+        "歩くとすぐに疲れます", "姿勢を保つのがつらいです",
+        "手足がだるいです", "体が重たく感じられます",
+        "動くのが面倒です", "階段がつらいです",
+        "長時間歩けません", "重いものを持ちたくないです",
+        "朝が起きられません", "体が疲れ切っています",
+        "筋肉が疲れています", "関節が痛いです",
+        "体がだるいです", "疲れが取れません",
+        "体が重いです", "動きたくないです",
+        "横になりたいです", "休みたいです",
+        "歩きたくないです", "立ちたくないです",
+        "階段を避けたいです", "重いものを持ちたくないです",
+        "筋肉がこわばります", "体が疲れています",
+        "だるさがあります", "重さがあります",
+        "倦怠感があります", "疲労感があります",
+        "体力がないです", "エネルギーがないです",
+        "疲れやすいです", "すぐに疲れます",
+        "長く動き続けられません", "持続しません",
+        "バテます", "消耗します",
+        "疲れを感じます", "疲労を感じます",
     ],
     "brain": [
         "頭がぼーっとして集中できません", "考えがまとまらない感じです",
         "ミスが増えていると感じます", "記憶力が落ちた気がします",
         "判断が遅くなったと感じます", "頭が回らない感じです",
-        "集中力が続かないです", "思考がクリアではありません"
+        "読んでも内容が入ってきません", "単純な計算で間違えます",
+        "注意力が散漫です", "アイデアが浮かびにくいです",
+        "思考がクリアではありません", "集中力が続かないです",
+        "物事を考えるのが面倒です", "頭を使う作業を避けたいです",
+        "記憶を思い出すのが大変です", "複数の作業ができません",
+        "指示を覚えるのが難しいです", "判断を誤ることが多いです",
+        "朝から頭が回りません", "頭が重いです",
+        "集中できません", "気が散ります",
+        "ぼーっとします", "頭が働きません",
+        "考えられません", "思考が止まります",
+        "アイデアが出ません", "創造性がありません",
+        "記憶できません", "思い出せません",
+        "覚えられません", "忘れます",
+        "計算できません", "計算ミスします",
+        "理解できません", "理解が遅いです",
+        "判断できません", "決断できません",
+        "迷います", "躊躇します",
+        "頭が疲れます", "脳が疲れます",
+        "思考が続きません", "集中が続きません",
+        "頭が重くなります", "頭が痛くなります",
+        "目が疲れます", "目が痛いです",
+        "頭がクラクラします", "めまいがします",
+        "頭がフラフラします", "ふらつきます",
+        "頭が不安定です", "頭が不安です",
+        "頭が心配です", "頭がストレスです",
+        "頭が緊張します", "頭が硬いです",
     ],
     "mental": [
         "やる気が出ない感じです", "イライラしやすいです",
         "人と話したくない気分です", "不安を感じることが多いです",
         "気力がわいてきません", "心が疲れた感じがします",
-        "何もしたくない気分です", "心が休まらない感じです"
+        "悲しい気持ちになります", "未来が憂鬱です",
+        "自分を責めてしまいます", "感情が不安定です",
+        "何にも興味がわきません", "楽しいと感じません",
+        "孤独を感じます", "プレッシャーを感じます",
+        "焦りを感じます", "心がざわざわします",
+        "気分が落ち込みます", "自分に自信が持てません",
+        "朝から気分が重いです", "何もしたくないです",
+        "気分が優れません", "気分がすぐれません",
+        "憂鬱です", "悲しいです",
+        "寂しいです", "孤独です",
+        "不安です", "心配です",
+        "怖いです", "怖いと感じます",
+        "緊張します", "緊張しています",
+        "ストレスを感じます", "ストレスです",
+        "プレッシャーです", "プレッシャーを感じています",
+        "イライラします", "怒りを感じます",
+        "腹が立ちます", "不満があります",
+        "不満を感じます", "不満です",
+        "苛立ちます", "苛ついています",
+        "疲れています", "心が疲れています",
+        "心が苦しいです", "心が痛いです",
+        "心が重いです", "心が沈みます",
+        "心が暗いです", "心が晴れません",
+        "心が疲れてます", "心が疲れた",
+        "心が疲れます", "心が疲れた",
+        "心が疲れてます", "心が疲れた",
+        "心が疲れます", "心が疲れた",
+        "心が疲れてます", "心が疲れた",
     ],
 }
 FATIGUE_CATS = ["body", "brain", "mental"]
 
-import random
-
-def select_random_questions() -> List[Dict[str, str]]:
+# -------------------------
+# 質問選択（前回の質問を避ける）
+# -------------------------
+def select_random_questions(prev_questions: Optional[List[str]] = None) -> List[Dict[str, str]]:
+    if prev_questions is None:
+        prev_questions = []
+    
     selected = []
     for cat in FATIGUE_CATS:
-        questions = random.sample(QUESTION_POOL[cat], min(2, len(QUESTION_POOL[cat])))
+        pool = QUESTION_POOL[cat]
+        available = [q for q in pool if q not in prev_questions]
+        if len(available) < 2:
+            available = pool
+        
+        questions = random.sample(available, min(2, len(available)))
         for q in questions:
             selected.append({"category": cat, "question": q})
+    
     random.shuffle(selected)
     return selected
 
 # -------------------------
-# 音声特徴量抽出 + 品質チェック強化
+# 音声特徴量抽出（Janome 追加）
 # -------------------------
+FATIGUE_KEYWORDS = [
+    "疲れた", "だるい", "眠い", "重い", "しんどい", "やる気",
+    "集中", "ぼーっと", "イライラ", "つらい",
+    "疲れてる", "疲れてます", "疲れ", "疲労", "倦怠",
+]
+
 def extract_audio_features_safe(audio_path: str, min_duration: float = 3.0, opensmile_use_cache: bool = True) -> Dict:
     whisper = None
     text = ""
@@ -306,22 +416,24 @@ def extract_audio_features_safe(audio_path: str, min_duration: float = 3.0, open
     else:
         smile_success = False
 
-    # 品質チェック強化
     text_len = len(text)
     unique_chars = len(set(text))
     speech_rate = text_len / max(duration, 1e-3) if duration > 0 else 0.0
     lexical_div = unique_chars / max(text_len, 1) if text_len > 0 else 0.0
     
-    keywords = ["疲れた", "しんどい", "だるい", "眠い", "つらい", "無理"]
-    fatigue_word_count = sum(text.count(k) for k in keywords)
+    fatigue_word_count = sum(text.count(k) for k in FATIGUE_KEYWORDS)
+    
+    # Janome で単語数カウント
+    word_count = get_word_count_janome(text)
 
-    # 品質条件：音声長 >= 3 秒, 文字数 >= 10, ユニーク文字数 >= 5, (OpenSMILE 成功 or 十分な文字起こし)
+    # 品質チェック強化：単語数も考慮
     duration_ok = duration >= min_duration
     text_len_ok = text_len >= 10
     unique_ok = unique_chars >= 5
-    smile_or_text = smile_success or (text_len >= 20 and unique_chars >= 10)
+    word_count_ok = word_count >= 3  # 3 単語以上
+    smile_or_text = smile_success or (text_len >= 20 and unique_chars >= 10 and word_count >= 5)
     
-    quality_ok = duration_ok and text_len_ok and unique_ok and smile_or_text
+    quality_ok = duration_ok and text_len_ok and unique_ok and smile_or_text and word_count_ok
     
     quality_message = "OK"
     if not quality_ok:
@@ -329,6 +441,7 @@ def extract_audio_features_safe(audio_path: str, min_duration: float = 3.0, open
         if not duration_ok: reasons.append("音声短")
         if not text_len_ok: reasons.append("文字少")
         if not unique_ok: reasons.append("単調")
+        if not word_count_ok: reasons.append("単語少")
         if not smile_or_text: reasons.append("品質不足")
         quality_message = f"品質 NG: {', '.join(reasons)}"
 
@@ -336,6 +449,7 @@ def extract_audio_features_safe(audio_path: str, min_duration: float = 3.0, open
         "text": text, "duration": duration, "speech_rate": speech_rate,
         "fatigue_word_count": fatigue_word_count, "text_length": text_len,
         "lexical_diversity": lexical_div, "unique_chars": unique_chars,
+        "word_count": word_count,
         "smile_features": smile_features,
         "quality_ok": quality_ok, "quality_message": quality_message,
         "smile_success": smile_success,
@@ -350,41 +464,145 @@ def encode_text_safe(text: str):
         return np.array([], dtype=np.float32)
 
 # -------------------------
-# サンプル ID 生成（重複対策）
+# サンプル ID 生成（日付 + choices）
 # -------------------------
-def generate_sample_id(text: str, speech_rate: float, text_length: int, smile_features: Dict) -> str:
-    """テキスト + 特徴量から SHA256 サンプル ID を生成"""
-    # smile_features の一部をサンプリング（軽量に）
+def generate_sample_id(text: str, speech_rate: float, text_length: int, smile_features: Dict, choices: List[int], date_str: str) -> str:
     smile_sample = {k: round(v, 3) for k, v in list(smile_features.items())[:10]}
-    content = f"{text}|{speech_rate:.3f}|{text_length}|{json.dumps(smile_sample, ensure_ascii=False, sort_keys=True)}"
+    content = f"{date_str}|{text}|{speech_rate:.3f}|{text_length}|{json.dumps(smile_sample, ensure_ascii=False, sort_keys=True)}|{choices}"
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 # -------------------------
 # 推論処理
 # -------------------------
-def get_confidence(scores: Dict[str, float]) -> str:
+def get_confidence(scores: Dict[str, float], similarities: Dict, audio_feat: Dict) -> str:
     if not scores:
         return "低"
+    
     mx = max(scores.values())
-    if mx >= 7:
-        return "高"
+    sorted_scores = sorted(scores.values(), reverse=True)
+    
+    # 一位 - 二位の差
+    if len(sorted_scores) >= 2:
+        diff = sorted_scores[0] - sorted_scores[1]
+    else:
+        diff = 1.0
+    
+    max_sim = max(similarities.get(f"sim_{cat}", 0.0) for cat in ["body", "brain", "mental"])
+    healthy_sim = similarities.get("sim_healthy", 0.0)
+    smile_ok = audio_feat.get("smile_success", False)
+    text_len = audio_feat.get("text_length", 0)
+    
+    # 固定閾値をやめて相対比較 + 差も考慮
+    if mx >= 7 and max_sim > healthy_sim and diff > 0.3:
+        if smile_ok or text_len >= 30:
+            return "高"
+        else:
+            return "中"
     elif mx >= 4:
         return "中"
     return "低"
 
+def get_confidence_percent(scores: Dict[str, float], similarities: Dict, audio_feat: Dict) -> float:
+    """confidence を 0-100% で返す"""
+    confidence_str = get_confidence(scores, similarities, audio_feat)
+    if confidence_str == "高":
+        return 84.0
+    elif confidence_str == "中":
+        return 50.0
+    else:
+        return 20.0
+
+def get_fatigue_type(scores: Dict[str, float]) -> str:
+    if not scores:
+        return "不明"
+    
+    max_score = max(scores.values())
+    max_cats = [cat for cat, score in scores.items() if score == max_score]
+    
+    sorted_scores = sorted(scores.values(), reverse=True)
+    if len(sorted_scores) >= 2:
+        diff = sorted_scores[0] - sorted_scores[1]
+        if diff <= 0.5:
+            high_cats = [cat for cat, score in scores.items() if score >= 6.0]
+            if len(high_cats) >= 2:
+                return "複合疲労"
+    
+    type_map = {"body": "身体疲れ", "brain": "脳疲れ", "mental": "心疲れ"}
+    return type_map.get(max_cats[0], "不明")
+
+def generate_all_comments(scores: Dict[str, float]) -> Dict[str, str]:
+    if not scores:
+        return {"body": "", "brain": "", "mental": ""}
+    
+    comments = {
+        "body": {
+            "high": "体がかなりお疲れのようです🛌 筋肉の疲労が蓄積している可能性があります。",
+            "mid": "身体に少し疲れが溜まっているかも。軽いストレッチがおすすめです。",
+            "low": "体の調子は良さそうです！✨"
+        },
+        "brain": {
+            "high": "頭をたくさん使いましたね🧠 認知機能が疲労しているサインです。",
+            "mid": "脳が少しお疲れ気味です。短い休憩を挟むとスッキリしますよ🌱",
+            "low": "頭は冴えているようです！💡"
+        },
+        "mental": {
+            "high": "心に負担がかかっているサインです☁️ 情緒的な疲労が見られます。",
+            "mid": "心が少しお疲れのようです。深呼吸してリラックスしましょう🍀",
+            "low": "心は落ち着いていて安定しています🌸"
+        },
+    }
+    
+    result = {}
+    for cat in ["body", "brain", "mental"]:
+        score = scores.get(cat, 0.0)
+        level = "high" if score >= 7 else "mid" if score >= 4 else "low"
+        result[cat] = comments.get(cat, {}).get(level, "")
+    return result
+
+def generate_summary_comment(scores: Dict[str, float]) -> str:
+    if not scores:
+        return ""
+    
+    high_cats = [cat for cat, score in scores.items() if score >= 7.0]
+    mid_cats = [cat for cat, score in scores.items() if 4.0 <= score < 7.0]
+    
+    comment_parts = []
+    
+    if len(high_cats) >= 2:
+        comment_parts.append("複数の疲労が見られます。")
+    elif len(high_cats) == 1:
+        cat = high_cats[0]
+        if cat == "body":
+            comment_parts.append("身体の疲れが特に目立ちます。")
+        elif cat == "brain":
+            comment_parts.append("脳の疲れが特に目立ちます。")
+        elif cat == "mental":
+            comment_parts.append("心の疲れが特に目立ちます。")
+    
+    if len(mid_cats) >= 2:
+        comment_parts.append("全体的に疲労が蓄積しています。")
+    
+    if not comment_parts:
+        comment_parts.append("良好な状態です。")
+    
+    return " ".join(comment_parts)
+
+# -------------------------
+# 予測関数
+# -------------------------
 def predict_fatigue_safe(audio_path: Optional[str]) -> Dict:
     log_memory("predict_before")
     
     if not audio_path:
-        return {"success": False, "message": "音声ファイルが指定されていません", "scores": {}, "confidence": "低"}
+        return {"success": False, "message": "音声ファイルが指定されていません", "scores": {}, "confidence": "低", "confidence_percent": 20.0}
 
     mem_mb = log_memory("predict_memcheck")
     if mem_mb is not None and mem_mb > MEMORY_THRESHOLD_CRITICAL:
-        return {"success": False, "message": "メモリ不足のため処理を中断しました", "scores": {}, "confidence": "低"}
+        return {"success": False, "message": "メモリ不足のため処理を中断しました", "scores": {}, "confidence": "低", "confidence_percent": 20.0}
 
     audio_feat = extract_audio_features_safe(audio_path)
     if not audio_feat["quality_ok"]:
-        return {"success": False, "message": audio_feat["quality_message"], "scores": {}, "confidence": "低", "audio_feat": audio_feat}
+        return {"success": False, "message": audio_feat["quality_message"], "scores": {}, "confidence": "低", "confidence_percent": 20.0, "audio_feat": audio_feat}
 
     query_emb = encode_text_safe(audio_feat["text"])
     ref_emb = get_reference_embeddings_safe()
@@ -423,8 +641,11 @@ def predict_fatigue_safe(audio_path: Optional[str]) -> Dict:
         except: pass
         gc.collect()
         
+        confidence = get_confidence(fallback_scores, similarities, audio_feat)
+        confidence_percent = get_confidence_percent(fallback_scores, similarities, audio_feat)
+        
         return {
-            "success": True, "scores": fallback_scores, "confidence": f"{get_confidence(fallback_scores)}（推定）",
+            "success": True, "scores": fallback_scores, "confidence": confidence, "confidence_percent": confidence_percent,
             "message": "簡易推定", "features": features, "audio_quality": f"{audio_feat['duration']:.1f}秒",
             "audio_feat": audio_feat, "similarities": similarities, "query_embedding": query_emb
         }
@@ -433,7 +654,7 @@ def predict_fatigue_safe(audio_path: Optional[str]) -> Dict:
     try:
         X_base_scaled = scaler.transform(X_base)
     except Exception:
-        return {"success": False, "message": "前処理に失敗しました", "scores": {}, "confidence": "低"}
+        return {"success": False, "message": "前処理に失敗しました", "scores": {}, "confidence": "低", "confidence_percent": 20.0}
 
     pca_n_comp = getattr(pca, "n_components_", getattr(pca, "n_components", 0))
     if query_emb.size == 0:
@@ -443,28 +664,33 @@ def predict_fatigue_safe(audio_path: Optional[str]) -> Dict:
             emb_pca = pca.transform(query_emb.reshape(1, -1))
         except Exception as e:
             logger.warning(f"PCA transform failed: {e}")
-            emb_pca = np.zeros((1, int(pca_n_comp) if pca_n_comp is not None else 0), dtype=np.float32)
+            # PCA 失敗時はエラーリターン（② 修正）
+            return {"success": False, "message": "PCA 前処理に失敗しました", "scores": {}, "confidence": "低", "confidence_percent": 20.0}
 
     X = np.hstack([X_base_scaled, emb_pca]) if emb_pca.size > 0 else X_base_scaled
 
     if metadata:
         expected_features = int(metadata.get("model_feature_count", X.shape[1]))
         if X.shape[1] != expected_features:
-            return {"success": False, "message": f"特徴量数不一致：{X.shape[1]} != {expected_features}", "scores": {}, "confidence": "低"}
+            return {"success": False, "message": f"特徴量数不一致：{X.shape[1]} != {expected_features}", "scores": {}, "confidence": "低", "confidence_percent": 20.0}
 
     scores = {}
     for cat in ["body", "brain", "mental"]:
         model = models.get(cat)
         if model:
             try:
-                scores[cat] = round(float(np.clip(float(model.predict(X)[0]), 0.0, 9.0)), 1)
+                # ① ラベルスケール修正：予測は 1-5 に統一
+                pred_raw = float(model.predict(X)[0])
+                # モデルが 0-9 出力なら 1-5 に変換
+                scores[cat] = round(float(np.clip(pred_raw * 5.0 / 9.0, 1.0, 5.0)), 1)
             except Exception as e:
                 logger.warning(f"Predict error for {cat}: {e}")
-                scores[cat] = 0.0
+                scores[cat] = 1.0
         else:
-            scores[cat] = 0.0
+            scores[cat] = 1.0
             
-    confidence = get_confidence(scores)
+    confidence = get_confidence(scores, similarities, audio_feat)
+    confidence_percent = get_confidence_percent(scores, similarities, audio_feat)
     
     try: del ref_emb, X_base, X_base_scaled, emb_pca, X
     except: pass
@@ -472,13 +698,13 @@ def predict_fatigue_safe(audio_path: Optional[str]) -> Dict:
     log_memory("predict_after")
     
     return {
-        "success": True, "scores": scores, "confidence": confidence, "message": "OK",
+        "success": True, "scores": scores, "confidence": confidence, "confidence_percent": confidence_percent, "message": "OK",
         "features": features, "audio_quality": f"{audio_feat['duration']:.1f}秒",
         "audio_feat": audio_feat, "similarities": similarities, "query_embedding": query_emb
     }
 
 # -------------------------
-# データ保存（重複チェック + embedding 削除 + ラベル平均化）
+# データ保存（history 保存追加）
 # -------------------------
 def save_to_hf_dataset_with_retry_safe(file_path: str, repo_path: str, max_retries: int = 3):
     if not HF_TOKEN or not REPO_ID: return False
@@ -497,39 +723,22 @@ def save_to_hf_dataset_with_retry_safe(file_path: str, repo_path: str, max_retri
             time.sleep(2 ** attempt)
     return False
 
-def save_data_with_result_safe(audio_feat, query_emb, user_labels: Dict[str, float], pred_scores: Dict[str, float], similarities: Dict, questions: List[Dict[str, str]], choices: List[int]) -> str:
-    """
-    user_labels: 未使用（新方式では choices から計算）
-    questions: [{"category": "body", "question": "..."}, ...]
-    choices: [4, 2, 5, 4, 3, 2] などのスライダー値
-    """
+def save_data_with_result_safe(audio_feat, query_emb, pred_scores: Dict[str, float], similarities: Dict, 
+                                questions: List[Dict[str, str]], choices: List[int]) -> str:
     if not audio_feat or not audio_feat.get("quality_ok", False):
         return "音声品質不足のため保存をスキップしました"
     
-    # ① ラベル集約：各カテゴリの平均値を計算
-    category_scores = {"body": [], "brain": [], "mental": []}
-    for i, q in enumerate(questions):
-        cat = q["category"]
-        if i < len(choices):
-            raw_val = choices[i]
-            # 1-5 スケールを 0-9 スケールに変換
-            scaled = (raw_val - 1) * 2.25
-            category_scores[cat].append(scaled)
-    
-    # 平均値を計算（0-9 スケール）
-    label_body = np.mean(category_scores["body"]) if category_scores["body"] else 0.0
-    label_brain = np.mean(category_scores["brain"]) if category_scores["brain"] else 0.0
-    label_mental = np.mean(category_scores["mental"]) if category_scores["mental"] else 0.0
-    
-    # ③ 重複チェック：サンプル ID 生成
+    # ③ 日付を sample_id に含める
+    date_str = datetime.now().strftime("%Y-%m-%d")
     sample_id = generate_sample_id(
         audio_feat.get("text", ""),
         audio_feat.get("speech_rate", 0.0),
         audio_feat.get("text_length", 0),
-        audio_feat.get("smile_features", {})
+        audio_feat.get("smile_features", {}),
+        choices,
+        date_str
     )
     
-    # 既存データに同じ sample_id がないか確認
     lock = DATA_PARQUET + ".lock"
     if not _acquire_lock(lock, timeout=10):
         return "保存ロックの取得に失敗しました"
@@ -537,26 +746,62 @@ def save_data_with_result_safe(audio_feat, query_emb, user_labels: Dict[str, flo
     try:
         existing = pd.read_parquet(DATA_PARQUET) if os.path.exists(DATA_PARQUET) and os.path.getsize(DATA_PARQUET) > 0 else pd.DataFrame()
         
-        # 重複チェック
         if "sample_id" in existing.columns and sample_id in existing["sample_id"].values:
             QUALITY_STATS["duplicate_blocked_count"] += 1
             log_quality_stats()
             return "同じ内容のデータはすでに送信されています"
         
-        # ④ text_embedding を保存しない
+        category_choices = {"body": [], "brain": [], "mental": []}
+        category_questions = {"body": [], "brain": [], "mental": []}
+        
+        for i, q in enumerate(questions):
+            cat = q["category"]
+            if i < len(choices):
+                category_choices[cat].append(choices[i])
+                category_questions[cat].append(q["question"])
+        
+        # ① ラベルスケール修正：1-5 をそのまま保存
+        avg_body = np.mean(category_choices["body"]) if category_choices["body"] else 0.0
+        avg_brain = np.mean(category_choices["brain"]) if category_choices["brain"] else 0.0
+        avg_mental = np.mean(category_choices["mental"]) if category_choices["mental"] else 0.0
+        
+        std_body = np.std(category_choices["body"]) if len(category_choices["body"]) > 1 else 0.0
+        std_brain = np.std(category_choices["brain"]) if len(category_choices["brain"]) > 1 else 0.0
+        std_mental = np.std(category_choices["mental"]) if len(category_choices["mental"]) > 1 else 0.0
+        
         df_row = {
             "text": audio_feat.get("text", ""),
-            # "text_embedding": embed_to_json(query_emb),  # 削除
             "speech_rate": float(audio_feat.get("speech_rate", 0.0)),
             "fatigue_word_count": float(audio_feat.get("fatigue_word_count", 0.0)),
             "text_length": int(audio_feat.get("text_length", 0)),
             "lexical_diversity": float(audio_feat.get("lexical_diversity", 0.0)),
             "unique_chars": int(audio_feat.get("unique_chars", 0)),
+            "word_count": int(audio_feat.get("word_count", 0)),
             **{k: float(v) for k, v in audio_feat.get("smile_features", {}).items()},
             **{k: float(v) for k, v in similarities.items()},
-            "label_body": float(label_body),
-            "label_brain": float(label_brain),
-            "label_mental": float(label_mental),
+            # ① 平均ラベル（1-5 スケール）
+            "label_body_avg": float(avg_body),
+            "label_brain_avg": float(avg_brain),
+            "label_mental_avg": float(avg_mental),
+            # 標準偏差
+            "label_body_std": float(std_body),
+            "label_brain_std": float(std_brain),
+            "label_mental_std": float(std_mental),
+            # 個別回答 + 質問テキスト
+            "label_body_q1": float(category_choices["body"][0]) if len(category_choices["body"]) > 0 else 0.0,
+            "label_body_q2": float(category_choices["body"][1]) if len(category_choices["body"]) > 1 else 0.0,
+            "label_brain_q1": float(category_choices["brain"][0]) if len(category_choices["brain"]) > 0 else 0.0,
+            "label_brain_q2": float(category_choices["brain"][1]) if len(category_choices["brain"]) > 1 else 0.0,
+            "label_mental_q1": float(category_choices["mental"][0]) if len(category_choices["mental"]) > 0 else 0.0,
+            "label_mental_q2": float(category_choices["mental"][1]) if len(category_choices["mental"]) > 1 else 0.0,
+            # 質問テキスト
+            "label_body_q1_text": category_questions["body"][0] if len(category_questions["body"]) > 0 else "",
+            "label_body_q2_text": category_questions["body"][1] if len(category_questions["body"]) > 1 else "",
+            "label_brain_q1_text": category_questions["brain"][0] if len(category_questions["brain"]) > 0 else "",
+            "label_brain_q2_text": category_questions["brain"][1] if len(category_questions["brain"]) > 1 else "",
+            "label_mental_q1_text": category_questions["mental"][0] if len(category_questions["mental"]) > 0 else "",
+            "label_mental_q2_text": category_questions["mental"][1] if len(category_questions["mental"]) > 1 else "",
+            # 推論結果（0-9 スケール）
             "pred_body": float(pred_scores.get("body", 0.0)),
             "pred_brain": float(pred_scores.get("brain", 0.0)),
             "pred_mental": float(pred_scores.get("mental", 0.0)),
@@ -572,10 +817,13 @@ def save_data_with_result_safe(audio_feat, query_emb, user_labels: Dict[str, flo
         try:
             combined.to_parquet(tmp_path, index=False)
             os.replace(tmp_path, DATA_PARQUET)
+            
+            # ⑧ history 保存
+            history_file = os.path.join(HISTORY_DIR, f"{datetime.now().strftime('%Y%m%d_%H%M')}.parquet")
+            combined.to_parquet(history_file, index=False)
         finally:
             if os.path.exists(tmp_path): os.remove(tmp_path)
         
-        # 品質統計更新
         QUALITY_STATS["quality_ok_count"] += 1
         if audio_feat.get("smile_success", False):
             QUALITY_STATS["smile_success_count"] += 1
@@ -584,48 +832,10 @@ def save_data_with_result_safe(audio_feat, query_emb, user_labels: Dict[str, flo
     finally:
         _release_lock(lock)
 
+    # ⑨ HF アップロード改善
     save_to_hf_dataset_with_retry_safe(DATA_PARQUET, "dataset.parquet")
     
     return f"無事に保存されました🌱（累計データ数：{len(combined)}件）"
-
-# -------------------------
-# UI コンポーネント
-# -------------------------
-def generate_all_comments(scores: Dict[str, float]) -> Dict[str, str]:
-    if not scores:
-        return {"body": "", "brain": "", "mental": ""}
-    
-    comments = {
-        "body": {
-            "high": "体がかなりお疲れのようです🛌 今日は早めにお布団に入って、ゆっくり休んでくださいね。",
-            "mid": "身体に少し疲れが溜まっているかも。温かい飲み物でもいかがですか？☕",
-            "low": "体の調子は良さそうです！✨"
-        },
-        "brain": {
-            "high": "頭をたくさん使いましたね🧠 画面から少し離れて、目を閉じる時間を作ってみてください。",
-            "mid": "脳が少しお疲れ気味です。短い休憩を挟むとスッキリしますよ🌱",
-            "low": "頭は冴えているようです！💡"
-        },
-        "mental": {
-            "high": "心に負担がかかっているサインです☁️ 好きな音楽を聴いたり、まずは自分を甘やかしてあげてくださいね。",
-            "mid": "心が少しお疲れのようです。深呼吸して、リラックスする時間をとりましょう🍀",
-            "low": "心は落ち着いていて安定しています🌸"
-        },
-    }
-    
-    result = {}
-    for cat in ["body", "brain", "mental"]:
-        score = scores.get(cat, 0.0)
-        level = "high" if score >= 7 else "mid" if score >= 4 else "low"
-        result[cat] = comments.get(cat, {}).get(level, "")
-    return result
-
-def get_fatigue_type(scores: Dict[str, float]) -> str:
-    if not scores:
-        return "不明"
-    max_cat = max(scores, key=scores.get)
-    type_map = {"body": "身体疲れ", "brain": "脳疲れ", "mental": "心疲れ"}
-    return type_map.get(max_cat, "不明")
 
 # -------------------------
 # Streamlit App
@@ -635,7 +845,6 @@ st.set_page_config(page_title="Restee - 休息のデザイン", page_icon="🌱"
 st.title("🌱 Restee - AI モデル開発用")
 st.markdown("音声での対話から疲労の種類を分析して休み方を提案するアプリを作りたいです。ご協力お願いします！！")
 
-# 冒頭にデータ数表示
 try:
     if os.path.exists(DATA_PARQUET) and os.path.getsize(DATA_PARQUET) > 0:
         df_tmp = pd.read_parquet(DATA_PARQUET)
@@ -646,14 +855,17 @@ except Exception:
     pass
 
 # セッション初期化
-if "questions" not in st.session_state: st.session_state["questions"] = select_random_questions()
+if "questions" not in st.session_state: 
+    st.session_state["questions"] = select_random_questions()
+    st.session_state["prev_questions"] = [q["question"] for q in st.session_state["questions"]]
 if "analyzed" not in st.session_state: st.session_state["analyzed"] = False
 if "last_result" not in st.session_state: st.session_state["last_result"] = None
 if "data_saved" not in st.session_state: st.session_state["data_saved"] = False
 if "save_msg" not in st.session_state: st.session_state["save_msg"] = ""
-if "uploaded_file_hash" not in st.session_state: st.session_state["uploaded_file_hash"] = None
+if "audio_data" not in st.session_state: st.session_state["audio_data"] = None
+if "audio_hash" not in st.session_state: st.session_state["audio_hash"] = None
 
-# アンケートカード（各カテゴリ 2 問、計 6 問）
+# アンケートカード
 with st.container():
     st.subheader("📝 1. 今の感覚に近いものを教えてください")
     st.caption("1: 全く当てはまらない 〜 5: 非常に当てはまる")
@@ -667,43 +879,46 @@ with st.container():
         st.markdown("<br>", unsafe_allow_html=True)
         
     if st.button("🔄 質問を変える", help="別の質問にシャッフルします"):
-        st.session_state["questions"] = select_random_questions()
-        for i in range(len(st.session_state["questions"])): st.session_state.pop(f"choice_{i}", None)
+        prev_qs = st.session_state.get("prev_questions", [])
+        st.session_state["questions"] = select_random_questions(prev_qs)
+        st.session_state["prev_questions"] = [q["question"] for q in st.session_state["questions"]]
+        for i in range(len(st.session_state["questions"])): 
+            st.session_state.pop(f"choice_{i}", None)
         st.rerun()
 
 st.divider()
 
-# 音声アップロードと解析
+# 音声録音
 st.subheader("🎤 2. 今の気持ちを声で残してみる")
 st.markdown("「今日はちょっと疲れたな」「なんだか体が重い」など、今の状態を数秒つぶやいてみてください。")
 st.caption("🔒 音声データそのものは保存されません。匿名化された特徴量のみが研究目的で利用されます。個人を特定できる情報は収集しません。")
 
-uploaded_file = st.file_uploader("音声ファイルを選択 (WAV / MP3 等)", type=["wav", "mp3", "m4a", "ogg"])
+audio_value = st.audio_input("音声を録音してください")
 
-if uploaded_file is not None:
-    file_hash = hashlib.sha256(uploaded_file.getvalue()).hexdigest()
+if audio_value is not None:
+    audio_hash = hashlib.sha256(audio_value.read()).hexdigest()
+    audio_value.seek(0)
     
-    if st.session_state["uploaded_file_hash"] != file_hash:
-        st.session_state["uploaded_file_hash"] = file_hash
+    if st.session_state["audio_hash"] != audio_hash:
+        st.session_state["audio_hash"] = audio_hash
+        st.session_state["audio_data"] = audio_value
         st.session_state["analyzed"] = False
         st.session_state["data_saved"] = False
         st.session_state["save_msg"] = ""
-        
-    st.audio(uploaded_file)
+    
+    st.audio(st.session_state["audio_data"])
     
     analyzed = st.session_state.get("analyzed", False)
-    data_saved = st.session_state.get("data_saved", False)
     
     if st.button("✨ 解析する！", type="primary", use_container_width=True, disabled=analyzed):
         with st.spinner("声のトーンや言葉を紐解いています..."):
             tmp_path = None
             try:
                 tmp_dir = tempfile.gettempdir()
-                tmp_path = os.path.join(tmp_dir, f"restee_upload_{int(time.time()*1000)}_{uploaded_file.name}")
+                tmp_path = os.path.join(tmp_dir, f"restee_rec_{int(time.time()*1000)}.wav")
                 with open(tmp_path, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
+                    f.write(st.session_state["audio_data"].read())
                 
-                # 品質統計：total_attempts カウント
                 QUALITY_STATS["total_attempts"] += 1
                 
                 st.session_state["last_result"] = predict_fatigue_safe(tmp_path)
@@ -717,7 +932,7 @@ if uploaded_file is not None:
                     try: os.remove(tmp_path)
                     except: pass
 
-# 結果表示エリア
+# 結果表示
 if st.session_state["analyzed"] and st.session_state["last_result"]:
     res = st.session_state["last_result"]
     st.divider()
@@ -725,32 +940,42 @@ if st.session_state["analyzed"] and st.session_state["last_result"]:
     
     if not res.get("success", False):
         st.warning(f"うまく読み取れませんでした：{res.get('message', '')}")
-        # 品質 NG もカウント
         if "quality_ok" in res.get("audio_feat", {}):
             QUALITY_STATS["quality_ng_count"] += 1
             log_quality_stats()
     else:
         scores = res.get("scores", {})
+        similarities = res.get("similarities", {})
+        audio_feat = res.get("audio_feat", {})
         
         fatigue_type = get_fatigue_type(scores)
         st.success(f"📈 あなたの疲れタイプ：**{fatigue_type}**")
         
+        summary = generate_summary_comment(scores)
+        if summary:
+            st.info(f"📊 {summary}")
+        
         all_comments = generate_all_comments(scores)
         with st.expander("💬 各カテゴリのコメントを見る"):
-            st.write(f"**💪 身体**: {all_comments.get('body', '')}")
-            st.write(f"**🧠 脳**: {all_comments.get('brain', '')}")
-            st.write(f"**💙 心**: {all_comments.get('mental', '')}")
+            st.write(f"💪 身体: {all_comments.get('body', '')}")
+            st.write(f"🧠 脳: {all_comments.get('brain', '')}")
+            st.write(f"💙 心: {all_comments.get('mental', '')}")
         
         col1, col2, col3 = st.columns(3)
         metrics = [("身体の疲れ", "body", "💪"), ("頭の疲れ", "brain", "🧠"), ("心の疲れ", "mental", "💙")]
         
         for col, (label, cat, icon) in zip([col1, col2, col3], metrics):
             val = scores.get(cat, 0.0)
+            # ⑩ 表示時 0-9 スケールに変換
+            display_val = val * 9.0 / 5.0 if val > 0 else 0.0
             with col:
-                st.metric(f"{icon} {label}", f"{val:.1f} / 9")
-                st.progress(float(np.clip(val / 9.0, 0.0, 1.0)))
+                st.metric(f"{icon} {label}", f"{display_val:.1f} / 9")
+                st.progress(float(np.clip(display_val / 9.0, 0.0, 1.0)))
         
-        st.write(f"**信頼度**: {res.get('confidence', '低')}")
+        # ⑩ confidence を % 表示
+        confidence = res.get("confidence", "低")
+        confidence_percent = res.get("confidence_percent", 20.0)
+        st.write(f"**信頼度**: {confidence} ({confidence_percent:.0f}%)")
 
         with st.expander("🛠️ 解析の詳細データを見る"):
             st.write("各スコア (0-9):", {k: f"{v:.1f}" for k, v in scores.items()})
@@ -763,9 +988,9 @@ if st.session_state["analyzed"] and st.session_state["last_result"]:
         st.markdown("""
         差し支えなければ、今回の結果を匿名データとして送信してください。
         
-        - 🔒 **音声データそのものは保存されません**
-        - 📊 **匿名化された特徴量のみが研究目的で利用されます**
-        - 👤 **個人を特定できる情報は収集しません**
+        - 🔒 音声データそのものは保存されません
+        - 📊 匿名化された特徴量のみがモデル開発目的で利用されます
+        - 👤 個人を特定できる情報は収集しません
         
         安心してご協力ください！
         """)
@@ -775,7 +1000,6 @@ if st.session_state["analyzed"] and st.session_state["last_result"]:
         else:
             if st.button("💾 この結果を匿名で送信する", type="secondary"):
                 with st.spinner("データを送っています..."):
-                    # ① 回答をリストで取得
                     choices = []
                     for i in range(len(st.session_state["questions"])):
                         choices.append(st.session_state.get(f"choice_{i}", 3))
@@ -785,7 +1009,6 @@ if st.session_state["analyzed"] and st.session_state["last_result"]:
                     save_msg = save_data_with_result_safe(
                         audio_feat=audio_feat,
                         query_emb=res.get("query_embedding"),
-                        user_labels={},  # 未使用（新方式では choices から計算）
                         pred_scores=scores,
                         similarities=res.get("similarities", {}),
                         questions=st.session_state["questions"],
