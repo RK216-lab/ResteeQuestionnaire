@@ -124,14 +124,24 @@ def log_memory(label: str):
 # モデル / ライブラリ
 # -------------------------
 @st.cache_resource
-def get_whisper_model_safe():
+def get_asr_model_safe():
+    """Moonshine Tiny JA を Streamlit Community Cloud 向けに安全にロード（CPU / float32 / low mem）"""
     try:
-        from faster_whisper import WhisperModel
-        model = WhisperModel("tiny", device="cpu", compute_type="int8", cpu_threads=1, num_workers=1)
-        log_memory("whisper_loaded")
-        return model
+        from transformers import MoonshineForConditionalGeneration, AutoProcessor
+        import torch
+        device = "cpu"
+        torch_dtype = torch.float32
+        model = MoonshineForConditionalGeneration.from_pretrained(
+            "UsefulSensors/moonshine-tiny-ja",
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+        ).to(device)
+        model.eval()
+        processor = AutoProcessor.from_pretrained("UsefulSensors/moonshine-tiny-ja")
+        log_memory("moonshine_tiny_ja_loaded")
+        return {"model": model, "processor": processor}
     except Exception as e:
-        logger.warning(f"Whisper load failed: {e}")
+        logger.warning(f"Moonshine Tiny JA load failed: {e}")
         return None
 
 @st.cache_resource
@@ -336,18 +346,45 @@ FATIGUE_KEYWORDS = [
 ]
 
 def extract_audio_features_safe(audio_path: str, opensmile_use_cache: bool = True) -> Dict:
-    whisper = None
     text = ""
     duration = 0.0
 
     try:
-        whisper = get_whisper_model_safe()
-        if whisper is not None:
-            segments, info = whisper.transcribe(audio_path, language="ja", beam_size=1, vad_filter=True, condition_on_previous_text=False)
-            text = "".join(s.text for s in segments).strip()
-            duration = float(info.duration) if (info and hasattr(info, "duration")) else 0.0
+        asr = get_asr_model_safe()
+        if asr is not None:
+            import torch
+            import librosa
+
+            # Moonshine Tiny JA は 16kHz mono 必須
+            audio_array, sr = librosa.load(audio_path, sr=16000, mono=True)
+            duration = float(len(audio_array) / sr) if sr > 0 else 0.0
+
+            processor = asr["processor"]
+            model = asr["model"]
+
+            inputs = processor(
+                audio_array,
+                return_tensors="pt",
+                sampling_rate=processor.feature_extractor.sampling_rate,
+            )
+            inputs = {k: v.to("cpu") for k, v in inputs.items()}
+
+            # 公式の hallucination 防止（JA用 13 tokens/sec）
+            token_limit_factor = 13.0 / processor.feature_extractor.sampling_rate
+            if "attention_mask" in inputs:
+                seq_lens = inputs["attention_mask"].sum(dim=-1)
+                max_length = max(10, int((seq_lens * token_limit_factor).max().item()))
+            else:
+                max_length = max(10, int(duration * 13) + 5)
+
+            with torch.no_grad():
+                generated_ids = model.generate(**inputs, max_length=max_length)
+            text = processor.decode(generated_ids[0], skip_special_tokens=True).strip()
+
+            # 一時変数を解放
+            del inputs, generated_ids, audio_array
     except Exception as e:
-        logger.warning(f"Whisper transcribe error: {e}")
+        logger.warning(f"Moonshine Tiny JA transcribe error: {e}")
 
     smile_features = {}
     smile_success = False
