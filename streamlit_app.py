@@ -138,8 +138,7 @@ def get_whisper_model_safe():
 def get_embedding_model_safe():
     try:
         from sentence_transformers import SentenceTransformer
-        # ☁️ メモリ大幅削減 (約470MB -> 約50MB) かつ精度を維持する日本語特化の軽量モデルに変更
-        model = SentenceTransformer("oshizo/sbert-jsnli-luke-japanese-base-lite", device="cpu")
+        model = SentenceTransformer("intfloat/multilingual-e5-small", device="cpu")
         log_memory("embedding_loaded")
         return model
     except Exception as e:
