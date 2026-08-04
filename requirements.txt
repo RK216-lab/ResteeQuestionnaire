@@ -6,6 +6,8 @@ joblib
 lightgbm
 transformers
 torch
+torchvision
+matplotlib
 librosa
 sentence-transformers
 opensmile
