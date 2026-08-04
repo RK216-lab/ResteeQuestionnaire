@@ -8,6 +8,7 @@ transformers
 torch
 torchvision
 matplotlib
+japanize_matplotlib
 librosa
 sentence-transformers
 opensmile
