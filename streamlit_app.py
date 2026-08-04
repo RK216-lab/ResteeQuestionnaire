@@ -25,7 +25,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("restee_safe")
 
 # Config
-# 🚀 改善点 1: st.secrets を優先
 HF_TOKEN = st.secrets.get("HF_TOKEN", os.environ.get("HF_TOKEN", ""))
 REPO_ID = st.secrets.get("REPO_ID", os.environ.get("REPO_ID", ""))
 DATA_DIR = "data_store"
@@ -42,7 +41,6 @@ PCA_FILE = os.path.join(MODEL_DIR, "pca.pkl")
 SCALER_FILE = os.path.join(MODEL_DIR, "scaler.pkl")
 METADATA_FILE = os.path.join(MODEL_DIR, "metadata.json")
 
-# ☁️ Streamlit Community Cloud に合わせたメモリ閾値に変更
 MEMORY_THRESHOLD_WARN = int(os.environ.get("MEM_WARN_MB", 2000))
 MEMORY_THRESHOLD_CRITICAL = int(os.environ.get("MEM_CRIT_MB", 2400))
 
@@ -55,7 +53,6 @@ MODEL_CONFIG = {
 OPENSMILE_VALID_RATIO = float(os.environ.get("OPENSMILE_VALID_RATIO", 0.6))
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
-# 機械学習用のシードは固定しつつ、質問選定などは SystemRandom で動かす
 RANDOM_SEED = int(os.environ.get("RANDOM_SEED", "42"))
 random.seed(RANDOM_SEED)
 sys_random = random.SystemRandom()
@@ -82,7 +79,7 @@ def log_quality_stats():
         logger.info(f"[QUALITY] total={QUALITY_STATS['total_attempts']}, ok={QUALITY_STATS['quality_ok_count']}, ng={QUALITY_STATS['quality_ng_count']}, smile_ok={QUALITY_STATS['smile_success_count']}, dup_blocked={QUALITY_STATS['duplicate_blocked_count']}")
 
 # -------------------------
-# 🚀 改善点 2: filelock による堅牢なロック
+# FileLock
 # -------------------------
 try:
     from filelock import FileLock, Timeout
@@ -90,41 +87,6 @@ try:
 except ImportError:
     HAS_FILELOCK = False
     logger.warning("filelock not installed. Using fallback lock mechanism.")
-
-def _acquire_lock_safe(lock_path: str, timeout: int = 10) -> bool:
-    """filelock を使用した安全なロック取得"""
-    if HAS_FILELOCK:
-        lock = FileLock(lock_path, timeout=timeout)
-        try:
-            lock.acquire()
-            return True
-        except Timeout:
-            return False
-    else:
-        # フォールバック：従来のロック機構
-        start = time.time()
-        while True:
-            try:
-                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.close(fd)
-                return True
-            except FileExistsError:
-                if time.time() - start > timeout:
-                    return False
-                time.sleep(0.1)
-            except OSError:
-                return False
-
-def _release_lock_safe(lock_path: str):
-    """ロック解放"""
-    if HAS_FILELOCK:
-        # filelock は with 句で自動解放されるため不要
-        pass
-    else:
-        try:
-            os.remove(lock_path)
-        except Exception:
-            pass
 
 def log_memory(label: str):
     try:
@@ -148,7 +110,6 @@ def log_memory(label: str):
 # -------------------------
 @st.cache_resource
 def get_asr_model_safe():
-    """Moonshine Tiny JA を Streamlit Community Cloud 向けに安全にロード（CPU / float32 / low mem）"""
     try:
         from transformers import MoonshineForConditionalGeneration, AutoProcessor
         import torch
@@ -296,7 +257,6 @@ QUESTION_POOL = {
         "普段より姿勢を保つのが難しいと感じることがあります",
         "体を動かすとすぐに疲れを感じることがあります",
     ],
-
     "brain": [
         "集中が続きにくいと感じることがあります",
         "考えをまとめるのに時間がかかることがあります",
@@ -315,7 +275,6 @@ QUESTION_POOL = {
         "理解に時間がかかることがあります",
         "情報を整理するのが難しく感じることがあります",
     ],
-
     "mental": [
         "気持ちが疲れていると感じることがあります",
         "ストレスを抱えやすいと感じることがあります",
@@ -337,9 +296,6 @@ QUESTION_POOL = {
 }
 FATIGUE_CATS = ["body", "brain", "mental"]
 
-# -------------------------
-# 質問選択（アクセスごとに必ずシャッフル）
-# -------------------------
 def select_random_questions(prev_questions: Optional[List[str]] = None) -> List[Dict[str, str]]:
     if prev_questions is None:
         prev_questions = []
@@ -351,7 +307,6 @@ def select_random_questions(prev_questions: Optional[List[str]] = None) -> List[
         if len(available) < 2:
             available = pool
         
-        # 🚀 random.SystemRandom() を使うことで、キャッシュやシード固定を無視してシャッフル
         questions = sys_random.sample(available, min(2, len(available)))
         for q in questions:
             selected.append({"category": cat, "question": q})
@@ -378,7 +333,6 @@ def extract_audio_features_safe(audio_path: str, opensmile_use_cache: bool = Tru
             import torch
             import librosa
 
-            # Moonshine Tiny JA は 16kHz mono 必須
             audio_array, sr = librosa.load(audio_path, sr=16000, mono=True)
             duration = float(len(audio_array) / sr) if sr > 0 else 0.0
 
@@ -392,7 +346,6 @@ def extract_audio_features_safe(audio_path: str, opensmile_use_cache: bool = Tru
             )
             inputs = {k: v.to("cpu") for k, v in inputs.items()}
 
-            # 公式の hallucination 防止（JA 用 13 tokens/sec）
             token_limit_factor = 13.0 / processor.feature_extractor.sampling_rate
             if "attention_mask" in inputs:
                 seq_lens = inputs["attention_mask"].sum(dim=-1)
@@ -404,7 +357,6 @@ def extract_audio_features_safe(audio_path: str, opensmile_use_cache: bool = Tru
                 generated_ids = model.generate(**inputs, max_length=max_length)
             text = processor.decode(generated_ids[0], skip_special_tokens=True).strip()
 
-            # 一時変数を解放
             del inputs, generated_ids, audio_array
     except Exception as e:
         logger.warning(f"Moonshine Tiny JA transcribe error: {e}")
@@ -444,9 +396,8 @@ def extract_audio_features_safe(audio_path: str, opensmile_use_cache: bool = Tru
     fatigue_word_count = sum(text.count(k) for k in FATIGUE_KEYWORDS)
     word_count = get_word_count_janome(text)
 
-    # 🚀 品質チェックを大幅に緩和し、「品質が低くて送れません」を防ぐ
-    duration_ok = duration >= 0.5  # 0.5 秒以上あれば OK
-    text_len_ok = text_len >= 2    # 2 文字以上あれば OK
+    duration_ok = duration >= 0.5
+    text_len_ok = text_len >= 2
     
     quality_ok = duration_ok and text_len_ok
     
@@ -484,7 +435,6 @@ def generate_sample_id(text: str, speech_rate: float, text_length: int, smile_fe
 # 推論処理
 # -------------------------
 def get_confidence(scores: Dict[str, float], similarities: Dict, audio_feat: Dict) -> str:
-    """スコアは 1.0〜5.0 スケールを前提にしたルールベース評価"""
     if not scores: return "低"
     mx = max(scores.values())
     sorted_scores = sorted(scores.values(), reverse=True)
@@ -495,7 +445,6 @@ def get_confidence(scores: Dict[str, float], similarities: Dict, audio_feat: Dic
     smile_ok = audio_feat.get("smile_success", False)
     text_len = audio_feat.get("text_length", 0)
     
-    # 1-5 スケールに合わせて閾値を調整
     if mx >= 4.0 and max_sim > healthy_sim and diff > 0.3:
         return "高" if (smile_ok or text_len >= 15) else "中"
     elif mx >= 2.5:
@@ -503,34 +452,19 @@ def get_confidence(scores: Dict[str, float], similarities: Dict, audio_feat: Dic
     return "低"
 
 def get_confidence_percent(scores: Dict[str, float], similarities: Dict, audio_feat: Dict) -> float:
-    """
-    解析品質スコア
-    音声品質・文章情報量・特徴量一致度から算出
-    """
-
     score = 0.0
-
-    # 音声長（最大30点）
     duration = audio_feat.get("duration", 0)
     score += min(duration / 10.0, 1.0) * 30
-
-    # 文字情報量（最大30点）
     text_length = audio_feat.get("text_length", 0)
     score += min(text_length / 30.0, 1.0) * 30
-
-    # OpenSMILE成功（最大20点）
     if audio_feat.get("smile_success", False):
         score += 20
-
-    # 類似度情報（最大20点）
     fatigue_sim = max(
         similarities.get("sim_body",0),
         similarities.get("sim_brain",0),
         similarities.get("sim_mental",0)
     )
-
     score += max(0, min(fatigue_sim,1.0)) * 20
-
     return round(score,1)
 
 def get_fatigue_type(scores: Dict[str, float]) -> str:
@@ -547,52 +481,157 @@ def get_fatigue_type(scores: Dict[str, float]) -> str:
 
 def generate_all_comments(scores: Dict[str, float]) -> Dict[str, str]:
     if not scores: return {"body": "", "brain": "", "mental": ""}
-    # 医学的な断定表現を避け、傾向・可能性ベースの柔らかい文言に変更
     comments = {
         "body": {
-            "high": "体がかなりお疲れのようです🛌 休息や軽いストレッチを意識してみてください。",
-            "mid": "身体に少し疲れが溜まっているかも。軽い運動や休憩がおすすめです。",
-            "low": "体の調子は良さそうです！✨"
+            "high": [
+                "体がかなりお疲れのようです。休息や軽いストレッチを意識してみてください。",
+                "身体に重さが残っている感じがします。今日は少し早めに休むのもおすすめです。",
+                "筋肉や関節に疲れが溜まっているかも。ゆっくり動く時間を大切に。",
+            ],
+            "mid": [
+                "身体に少し疲れが溜まっているかも。軽い運動や休憩がおすすめです。",
+                "体が「もう少し休みたい」と言っているかもしれません。無理は禁物です。",
+                "日常の動作に少し負担を感じやすい状態のようです。",
+            ],
+            "low": [
+                "体の調子は良さそうです。",
+                "身体は比較的軽やかな状態みたいです。この調子をキープを。",
+                "体のエネルギーはまずまず安定しています。",
+            ],
         },
         "brain": {
-            "high": "頭をたくさん使ったあとみたいです🧠 短い休憩を挟むとスッキリしやすいかも。",
-            "mid": "頭が少しお疲れ気味のようです。リフレッシュの時間を取ってみてください🌱",
-            "low": "頭はすっきりしているようです！💡"
+            "high": [
+                "頭をたくさん使ったあとみたいです。短い休憩を挟むとスッキリしやすいかも。",
+                "思考が少し重めのようです。5分でも目を閉じる時間を作ってみてください。",
+                "集中力が消耗している傾向があります。情報を減らす時間も大事です。",
+            ],
+            "mid": [
+                "頭が少しお疲れ気味のようです。リフレッシュの時間を取ってみてください。",
+                "考えをまとめるのに少し時間がかかる状態かも。焦らずいきましょう。",
+                "脳が「ちょっと休憩したい」サインを出しているかもしれません。",
+            ],
+            "low": [
+                "頭はすっきりしているようです。",
+                "思考は比較的クリアな状態みたいです。良い調子です。",
+                "頭の疲れは少なめのようです。",
+            ],
         },
         "mental": {
-            "high": "心に負担がかかっている傾向が出ています☁️ 無理せずリラックスする時間を大切に。",
-            "mid": "心が少しお疲れのようです。深呼吸や好きなことをする時間を取ってみてください🍀",
-            "low": "心は落ち着いていて安定しているようです🌸"
+            "high": [
+                "心に負担がかかっている傾向が出ています。無理せずリラックスする時間を大切に。",
+                "気持ちが少し重めかもしれません。好きな音楽や深呼吸を試してみてください。",
+                "心が「休みたい」と感じているようです。自分を責めないでくださいね。",
+            ],
+            "mid": [
+                "心が少しお疲れのようです。深呼吸や好きなことをする時間を取ってみてください。",
+                "気持ちの切り替えがやや難しい状態かも。小さな休息を重ねましょう。",
+                "心のエネルギーが少し低下気味のようです。",
+            ],
+            "low": [
+                "心は落ち着いていて安定しているようです。",
+                "気持ちは比較的穏やかな状態みたいです。このまま大切に。",
+                "心の疲れは少なめのようです。",
+            ],
         },
     }
     result = {}
     for cat in ["body", "brain", "mental"]:
         score = scores.get(cat, 0.0)
         level = "high" if score >= 4.0 else "mid" if score >= 2.5 else "low"
-        result[cat] = comments.get(cat, {}).get(level, "")
+        options = comments.get(cat, {}).get(level, [""])
+        result[cat] = sys_random.choice(options) if options else ""
     return result
 
 def generate_summary_comment(scores: Dict[str, float]) -> str:
     if not scores: return ""
     high_cats = [cat for cat, score in scores.items() if score >= 4.0]
     mid_cats = [cat for cat, score in scores.items() if 2.5 <= score < 4.0]
-    
-    parts = []
+
+    templates = []
     if len(high_cats) >= 2:
-        parts.append("複数の疲れ傾向が見られます。")
+        templates = [
+            "複数の疲れ傾向が同時に出ています。全体を休める時間を意識してみてください。",
+            "身体・頭・心のうち複数がお疲れ気味です。今日は無理をしない選択を。",
+            "複合的な疲れが見られます。小さな休息を積み重ねるのがおすすめです。",
+        ]
     elif len(high_cats) == 1:
         if high_cats[0] == "body":
-            parts.append("身体の疲れ傾向が特に出ています。")
+            templates = [
+                "身体の疲れ傾向が特に強く出ています。体を優先して休めてあげてください。",
+                "体が一番お疲れのようです。動かなくてもいい時間を作ってみましょう。",
+                "身体面の負担が目立ちます。軽いストレッチや早めの就寝が助けになるかも。",
+            ]
         elif high_cats[0] == "brain":
-            parts.append("頭の疲れ傾向が特に出ています。")
+            templates = [
+                "頭の疲れ傾向が特に出ています。情報を減らす時間を意識してみてください。",
+                "思考の消耗が目立ちます。短い休憩を挟むと回復しやすいです。",
+                "脳がお疲れ気味です。ぼーっとする時間も立派な休息ですよ。",
+            ]
         elif high_cats[0] == "mental":
-            parts.append("心の疲れ傾向が特に出ています。")
-    if len(mid_cats) >= 2:
-        parts.append("全体的に疲れが蓄積している可能性があります。")
-    
-    if not parts:
-        parts.append("比較的良好な状態のようです。")
-    return " ".join(parts)
+            templates = [
+                "心の疲れ傾向が特に出ています。気持ちを大切にする時間を作ってみてください。",
+                "心の負担が大きめです。好きなことに触れる時間を意識してみましょう。",
+                "心がお疲れのようです。自分を労わる選択を優先してみてください。",
+            ]
+    elif len(mid_cats) >= 2:
+        templates = [
+            "全体的に疲れが少しずつ蓄積している可能性があります。",
+            "複数の領域で中程度の疲れが見られます。早めのケアがおすすめです。",
+            "バランスよくお疲れ気味です。今日は少しペースを落としてみましょう。",
+        ]
+    else:
+        templates = [
+            "比較的良好な状態のようです。この調子を大切に。",
+            "全体的に安定した状態です。無理のない範囲で活動を続けてみてください。",
+            "疲れは少なめのようです。今日の自分を褒めてあげましょう。",
+        ]
+    return sys_random.choice(templates)
+
+def generate_rest_suggestions(scores: Dict[str, float], fatigue_type: str) -> List[Dict[str, str]]:
+    """疲れタイプに応じた休息提案を返す（タイトル + 説明）"""
+    suggestions = {
+        "body": [
+            {"title": "軽いストレッチやヨガを5分だけ", "desc": "筋肉をゆるめて、体の重さをほぐしましょう。"},
+            {"title": "温かいお風呂や足湯で体をほぐす", "desc": "副交感神経を優位にして、深いリラックスを得られます。"},
+            {"title": "早めに横になって体を休める", "desc": "動かなくてもいい時間を作ることが回復につながります。"},
+            {"title": "ゆっくり散歩して筋肉をゆるめる", "desc": "軽い運動で血行を促し、体のこわばりを和らげます。"},
+            {"title": "姿勢を意識して深呼吸を数回", "desc": "呼吸を整えるだけで体の緊張が少しずつ解けていきます。"},
+        ],
+        "brain": [
+            {"title": "スマホやPCから5〜10分離れる", "desc": "情報入力を止めて、脳に休む時間を与えましょう。"},
+            {"title": "目を閉じてぼーっとする時間を作る", "desc": "何も考えない時間が、思考の疲労回復に効きます。"},
+            {"title": "好きな音楽を聴きながら何もしない", "desc": "受動的に音楽を楽しむだけでも脳がリセットされます。"},
+            {"title": "簡単なメモや日記で頭の中を整理する", "desc": "書き出すことで思考の渋滞を解消しやすくなります。"},
+            {"title": "自然の音や映像を眺めて脳をリセット", "desc": "自然の刺激は脳のリラックスに効果的です。"},
+        ],
+        "mental": [
+            {"title": "深呼吸をゆっくり10回繰り返す", "desc": "呼吸を整えることで、心のざわつきを落ち着かせます。"},
+            {"title": "好きな飲み物を丁寧に味わう時間を作る", "desc": "小さな「丁寧な時間」が心の余裕を生みます。"},
+            {"title": "信頼できる人に短いメッセージを送る", "desc": "つながりを感じるだけで、孤独感が和らぎます。"},
+            {"title": "好きな写真や動画を眺めて気分転換", "desc": "ポジティブな刺激で気持ちを切り替えやすくなります。"},
+            {"title": "「今日はこれで十分」と自分に声をかける", "desc": "自分を認める言葉が、心の負担を軽くしてくれます。"},
+        ],
+        "common": [
+            {"title": "水分をしっかり摂る", "desc": "脱水は疲労感を増幅させます。こまめな水分補給を。"},
+            {"title": "睡眠時間を少しでも確保する", "desc": "質の良い睡眠が、体・頭・心すべての回復に効きます。"},
+            {"title": "今日の自分を「よく頑張った」と認める", "desc": "自己肯定感を高めることが、回復の第一歩です。"},
+            {"title": "無理に予定を入れず余白を残す", "desc": "空いた時間があるだけで、心に余裕が生まれます。"},
+        ],
+    }
+
+    selected = []
+    top_cat = None
+    if scores:
+        top_cat = max(scores, key=scores.get)
+        pool = suggestions.get(top_cat, [])
+        if pool:
+            selected.extend(sys_random.sample(pool, k=min(2, len(pool))))
+    selected.append(sys_random.choice(suggestions["common"]))
+    other_cats = [c for c in ["body", "brain", "mental"] if c != top_cat]
+    if other_cats:
+        other = sys_random.choice(other_cats)
+        selected.append(sys_random.choice(suggestions[other]))
+    return selected[:4]
 
 def predict_fatigue_safe(audio_path: Optional[str]) -> Dict:
     log_memory("predict_before")
@@ -639,10 +678,8 @@ def predict_fatigue_safe(audio_path: Optional[str]) -> Dict:
         fallback_scores = {}
         for cat in ["body", "brain", "mental"]:
             raw = max(similarities.get(f"sim_{cat}", 0.0) - similarities.get("sim_healthy", 0.0) * 0.5, 0.0)
-            # 1.0〜5.0 スケールに統一
             fallback_scores[cat] = round(float(np.clip(raw * 5.0 + 1.0, 1.0, 5.0)), 1)
         
-        # 🚀 改善点 3: メモリ解放
         try:
             del ref_emb
         except:
@@ -686,7 +723,6 @@ def predict_fatigue_safe(audio_path: Optional[str]) -> Dict:
         else:
             scores[cat] = 1.0
             
-    # 🚀 改善点 3: メモリ解放
     try:
         del ref_emb, X_base, X_base_scaled, emb_pca, X
     except:
@@ -733,13 +769,9 @@ def save_data_with_result_safe(audio_feat, query_emb, pred_scores: Dict[str, flo
         audio_feat.get("text_length", 0), audio_feat.get("smile_features", {}), choices, date_str
     )
     
-    # 🚀 改善点 2: filelock を使用
-    lock = DATA_PARQUET + ".lock"
-    if not _acquire_lock_safe(lock, timeout=10):
-        return "保存ロックの取得に失敗しました"
-    
-    try:
-        # 🚀 改善点 4: 巨大ファイルの処理
+    lock_path = DATA_PARQUET + ".lock"
+
+    def _do_save() -> str:
         existing = pd.DataFrame()
         if os.path.exists(DATA_PARQUET) and os.path.getsize(DATA_PARQUET) > 0:
             try:
@@ -807,32 +839,219 @@ def save_data_with_result_safe(audio_feat, query_emb, pred_scores: Dict[str, flo
             combined.to_parquet(history_file, index=False)
         finally:
             if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            
-    finally:
-        _release_lock_safe(lock)
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+        
+        return f"無事に保存されました（累計データ数：{len(combined)}件）"
+
+    if HAS_FILELOCK:
+        lock = FileLock(lock_path, timeout=10)
+        try:
+            with lock:
+                result_msg = _do_save()
+        except Timeout:
+            return "保存ロックの取得に失敗しました"
+    else:
+        start = time.time()
+        acquired = False
+        while True:
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                acquired = True
+                break
+            except FileExistsError:
+                if time.time() - start > 10:
+                    return "保存ロックの取得に失敗しました"
+                time.sleep(0.1)
+            except OSError:
+                return "保存ロックの取得に失敗しました"
+        
+        try:
+            result_msg = _do_save()
+        finally:
+            try:
+                os.remove(lock_path)
+            except Exception:
+                pass
 
     save_to_hf_dataset_with_retry_safe(DATA_PARQUET, "dataset.parquet")
-    return f"無事に保存されました🌱（累計データ数：{len(combined)}件）"
+    return result_msg
+
+@st.cache_data(ttl=60)
+def get_current_data_count() -> int:
+    """
+    HuggingFace Datasetを正として件数取得
+    """
+
+    # HF優先
+    if HF_TOKEN and REPO_ID:
+        try:
+            from huggingface_hub import hf_hub_download
+            import pyarrow.parquet as pq
+
+            path = hf_hub_download(
+                repo_id=REPO_ID,
+                filename="dataset.parquet",
+                repo_type="dataset",
+                token=HF_TOKEN,
+                force_download=True
+            )
+
+            pf = pq.ParquetFile(path)
+            return int(pf.metadata.num_rows)
+
+        except Exception as e:
+            logger.warning(f"HF count fetch failed: {e}")
+
+
+    # HF失敗時だけlocal fallback
+    try:
+        if os.path.exists(DATA_PARQUET):
+            df = pd.read_parquet(DATA_PARQUET)
+            return int(len(df))
+    except Exception:
+        pass
+
+    return 0
 
 # -------------------------
 # Streamlit App
 # -------------------------
-st.set_page_config(page_title="Restee - 休息のデザイン", page_icon="🌱", layout="centered")
+st.set_page_config(
+    page_title="Restee - 休息のデザイン",
+    page_icon="🌱",
+    layout="centered",
+    initial_sidebar_state="collapsed"
+)
+
+# ---- ダークテーマ + レポート用スタイル ----
+st.markdown("""
+<style>
+    /* 全体の背景と文字色 */
+    .main {
+        background-color: #0e1117;
+        color: #fafafa;
+    }
+    .stApp {
+        background-color: #0e1117;
+    }
+    
+    /* メトリックカード */
+    div[data-testid="stMetric"] {
+        background-color: #1f2937;
+        padding: 18px 16px;
+        border-radius: 12px;
+        border: 1px solid #374151;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+    }
+    div[data-testid="stMetricLabel"] {
+        color: #9ca3af !important;
+        font-size: 0.95rem !important;
+    }
+    div[data-testid="stMetricValue"] {
+        color: #ffffff !important;
+        font-size: 2.1rem !important;
+        font-weight: 700 !important;
+    }
+    div[data-testid="stMetricDelta"] {
+        color: #f59e0b !important;
+        font-size: 0.9rem !important;
+    }
+    
+    /* 見出し */
+    h1, h2, h3 {
+        color: #fafafa !important;
+    }
+    
+    /* アラート / 情報ボックス */
+    .stAlert {
+        background-color: #1f2937;
+        border: 1px solid #374151;
+        border-radius: 10px;
+    }
+    
+    /* 区切り線 */
+    hr {
+        border-color: #374151;
+    }
+    
+    /* キャプション */
+    .stCaption {
+        color: #9ca3af !important;
+    }
+    
+    /* 進捗バー */
+    .stProgress > div > div {
+        background-color: #60a5fa;
+    }
+    
+    /* ボタン */
+    .stButton > button {
+        border-radius: 8px;
+    }
+    
+    /* レポートカード風 */
+    .report-card {
+        background-color: #1f2937;
+        border: 1px solid #374151;
+        border-radius: 12px;
+        padding: 16px 18px;
+        margin-bottom: 12px;
+        height: 100%;
+    }
+    .report-card h4 {
+        margin: 0 0 8px 0;
+        color: #fafafa;
+        font-size: 1.05rem;
+    }
+    .report-card p {
+        margin: 0;
+        color: #d1d5db;
+        font-size: 0.92rem;
+        line-height: 1.5;
+    }
+    
+    /* 休息提案カード */
+    .tip-card {
+        background-color: #1f2937;
+        border: 1px solid #374151;
+        border-radius: 12px;
+        padding: 14px 16px;
+        margin-bottom: 10px;
+    }
+    .tip-card strong {
+        color: #fafafa;
+        font-size: 0.98rem;
+    }
+    .tip-card span {
+        color: #9ca3af;
+        font-size: 0.88rem;
+        display: block;
+        margin-top: 4px;
+    }
+    
+    /* 余白調整 */
+    .block-container {
+        padding-top: 1.5rem;
+        padding-bottom: 2rem;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 st.title("🌱 Restee - AI モデル開発用")
 st.markdown("音声での対話から疲労の種類を分析して休み方を提案するアプリを作りたいです。ご協力お願いします！！")
 
-try:
-    if os.path.exists(DATA_PARQUET) and os.path.getsize(DATA_PARQUET) > 0:
-        df_tmp = pd.read_parquet(DATA_PARQUET)
-        st.info(f"📊 現在 **{len(df_tmp)} 件** のデータが集まっています！ご協力ありがとうございます🌱")
-    else:
-        st.info("📊 現在 0 件 のデータが集まっています。最初のデータ提供者になりませんか？")
-except Exception:
-    pass
+# 件数表示
+count = get_current_data_count()
+if count > 0:
+    st.info(f"📊 現在 **{count} 件** のデータが集まっています！ご協力ありがとうございます🌱")
+else:
+    st.info("📊 現在 0 件 のデータが集まっています。最初のデータ提供者になりませんか？")
 
-# セッション初期化（アクセスごとに新しい質問を生成）
+# セッション初期化
 if "questions" not in st.session_state: 
     st.session_state["questions"] = select_random_questions()
     st.session_state["prev_questions"] = [q["question"] for q in st.session_state["questions"]]
@@ -880,8 +1099,11 @@ st.caption("🔒 音声データそのものは保存されません。匿名化
 audio_value = st.audio_input("音声を録音してください")
 
 if audio_value is not None:
-    audio_hash = hashlib.sha256(audio_value.read()).hexdigest()
     audio_value.seek(0)
+    audio_bytes = audio_value.read()
+    audio_value.seek(0)
+    
+    audio_hash = hashlib.sha256(audio_bytes).hexdigest()
     
     if st.session_state["audio_hash"] != audio_hash:
         st.session_state["audio_hash"] = audio_hash
@@ -894,13 +1116,13 @@ if audio_value is not None:
     
     analyzed = st.session_state.get("analyzed", False)
     
-    # 🚀 改善点 6: 解析ボタンの無効化条件を改善
     if st.button("✨ 解析する！", type="primary", use_container_width=True, disabled=analyzed):
         with st.spinner("声のトーンや言葉を紐解いています..."):
             tmp_path = None
             try:
                 tmp_dir = tempfile.gettempdir()
                 tmp_path = os.path.join(tmp_dir, f"restee_rec_{int(time.time()*1000)}.wav")
+                st.session_state["audio_data"].seek(0)
                 with open(tmp_path, "wb") as f:
                     f.write(st.session_state["audio_data"].read())
                 
@@ -919,14 +1141,16 @@ if audio_value is not None:
                     except:
                         pass
 
-# 結果表示
+# ============================================================
+# 結果表示（レポート風に整理）
+# ============================================================
 if st.session_state["analyzed"] and st.session_state["last_result"]:
     res = st.session_state["last_result"]
     st.divider()
-    st.subheader("🍀 あなたの今の状態")
     
-    # 研究用免責（常時表示）
-    st.caption("※ 本結果は研究用の推定であり、医学的な診断・助言ではありません。体調に不安がある場合は専門家にご相談ください。")
+    # ---- ヘッダー ----
+    st.markdown("# 🍀 あなたの疲労レポート")
+    st.caption("※本レポートは研究用のものであり、医学的な診断・助言・判断の代わりにはなりません。あくまで参考情報としてご利用ください。")
     
     if not res.get("success", False):
         st.warning(f"{res.get('message', '')}")
@@ -936,33 +1160,114 @@ if st.session_state["analyzed"] and st.session_state["last_result"]:
         audio_feat = res.get("audio_feat", {})
         
         fatigue_type = get_fatigue_type(scores)
-        st.success(f"📈 あなたの疲れタイプ：**{fatigue_type}**")
-        
         summary = generate_summary_comment(scores)
+        
+        # ---- 疲れタイプ ----
+        st.markdown(f"### あなたの疲れタイプ：**{fatigue_type}**")
         if summary:
-            st.info(f"📊 {summary}")
+            st.info(summary)
         
-        all_comments = generate_all_comments(scores)
-        with st.expander("💬 各カテゴリのコメントを見る"):
-            st.write(f"💪 身体：{all_comments.get('body', '')}")
-            st.write(f"🧠 脳：{all_comments.get('brain', '')}")
-            st.write(f"💙 心：{all_comments.get('mental', '')}")
-        
+        # ---- メトリクス（3列） ----
         col1, col2, col3 = st.columns(3)
-        metrics = [("身体の疲れ", "body", "💪"), ("頭の疲れ", "brain", "🧠"), ("心の疲れ", "mental", "💙")]
-        
-        for col, (label, cat, icon) in zip([col1, col2, col3], metrics):
+        metrics = [
+            ("💪 身体", "body"),
+            ("🧠 頭", "brain"),
+            ("💙 心", "mental"),
+        ]
+        max_score = max(scores.values()) if scores else 1.0
+        avg_score = sum(scores.values()) / 3 if scores else 1.0
+
+        for col, (label, cat) in zip([col1, col2, col3], metrics):
             val = scores.get(cat, 1.0)
-            # モデル本来の 1〜5 スケールをそのまま表示 + 疲労度%を併記
             fatigue_pct = float(np.clip((val - 1.0) / 4.0 * 100.0, 0.0, 100.0))
+            delta_txt = f"疲労度 {fatigue_pct:.0f}%"
+            if val == max_score and max_score - avg_score > 0.3:
+                delta_txt = f"▲ 最も高い {fatigue_pct:.0f}%"
             with col:
-                st.metric(f"{icon} {label}", f"{val:.1f} / 5", delta=f"疲労度 {fatigue_pct:.0f}%")
+                st.metric(label, f"{val:.1f} / 5", delta=delta_txt)
                 st.progress(float(np.clip((val - 1.0) / 4.0, 0.0, 1.0)))
+
+        st.markdown("")  # 余白
+
+        # ---- レーダーチャート / 棒グラフ ----
+        st.markdown("### 疲労度グラフ")
+        try:
+            import matplotlib.pyplot as plt
+
+            cats_jp = ["身体", "頭", "心"]
+            vals = [scores.get("body", 1.0), scores.get("brain", 1.0), scores.get("mental", 1.0)]
+            vals += vals[:1]
+            angles = np.linspace(0, 2 * np.pi, 3, endpoint=False).tolist()
+            angles += angles[:1]
+
+            fig, ax = plt.subplots(figsize=(4.5, 4.5), subplot_kw=dict(polar=True))
+            ax.plot(angles, vals, "o-", linewidth=2.5, color="#60a5fa", markersize=8)
+            ax.fill(angles, vals, alpha=0.3, color="#60a5fa")
+            ax.set_thetagrids(np.degrees(angles[:-1]), cats_jp, fontsize=12, color="#e5e7eb")
+            ax.set_ylim(1, 5)
+            ax.set_yticks([1, 2, 3, 4, 5])
+            ax.set_yticklabels(["1", "2", "3", "4", "5"], color="#9ca3af", fontsize=9)
+            ax.spines["polar"].set_color("#4b5563")
+            ax.grid(color="#4b5563", linestyle="--", alpha=0.6)
+            ax.set_facecolor("#1f2937")
+            fig.patch.set_facecolor("#0e1117")
+            ax.set_title("疲れ度レーダー（1〜5）", va="bottom", fontsize=13, color="#fafafa", pad=12)
+            st.pyplot(fig, use_container_width=False)
+            plt.close(fig)
+        except Exception:
+            chart_df = pd.DataFrame({
+                "カテゴリ": ["身体", "頭", "心"],
+                "疲れ度": [scores.get("body", 1.0), scores.get("brain", 1.0), scores.get("mental", 1.0)]
+            }).set_index("カテゴリ")
+            st.bar_chart(chart_df, height=240)
+
+        st.markdown("")  # 余白
+
+        # ---- カテゴリー別コメント（3列カード） ----
+        st.markdown("### カテゴリー別のコメント")
+        all_comments = generate_all_comments(scores)
         
-        confidence = res.get("confidence", "低")
+        c1, c2, c3 = st.columns(3)
+        comment_data = [
+            (c1, "💪 身体", "body", scores.get("body", 1.0)),
+            (c2, "🧠 頭", "brain", scores.get("brain", 1.0)),
+            (c3, "💙 心", "mental", scores.get("mental", 1.0)),
+        ]
+        for col, title, cat, val in comment_data:
+            with col:
+                st.markdown(f"""
+                <div class="report-card">
+                    <h4>{title}</h4>
+                    <p style="color:#60a5fa; font-weight:600; margin-bottom:8px;">{val:.1f} / 5</p>
+                    <p>{all_comments.get(cat, "")}</p>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.markdown("")  # 余白
+
+        # ---- おすすめ休息提案（2×2カード） ----
+        st.markdown("### 🌿 今日のおすすめ休息")
+        tips = generate_rest_suggestions(scores, fatigue_type)
+        
+        # 2列レイアウトでカード表示
+        for i in range(0, len(tips), 2):
+            cols = st.columns(2)
+            for j, tip in enumerate(tips[i:i+2]):
+                with cols[j]:
+                    st.markdown(f"""
+                    <div class="tip-card">
+                        <strong>{tip["title"]}</strong>
+                        <span>{tip["desc"]}</span>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+        st.markdown("")  # 余白
+
+        # ---- 解析品質 ----
         confidence_percent = res.get("confidence_percent", 20.0)
-        st.write(f"**解析品質スコア**: {confidence_percent:.0f}%")
-        st.caption("音声品質・特徴量の一致度などから算出した参考指標です。モデルの確率出力ではありません。")
+        st.markdown("---")
+        st.caption(f"解析に利用できた情報量: **{confidence_percent:.0f}%**")
+        st.caption("音声の長さ・文字数・特徴量の充実度などから算出した参考指標です。モデルの自信度ではありません。")
         
         if DEBUG:
             with st.expander("🛠️ 解析の詳細データを見る"):
@@ -970,6 +1275,7 @@ if st.session_state["analyzed"] and st.session_state["last_result"]:
                 st.write("オーディオ品質:", res.get("audio_quality", ""))
                 st.json(res.get("features", {}))
             
+        # ---- データ送信 ----
         st.divider()
         st.subheader("🤝 開発へのご協力のお願い")
         st.markdown("""
