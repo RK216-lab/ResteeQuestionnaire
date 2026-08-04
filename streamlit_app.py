@@ -1192,19 +1192,30 @@ if st.session_state["analyzed"] and st.session_state["last_result"]:
         # ---- レーダーチャート / 棒グラフ ----
         st.markdown("### 疲労度グラフ")
         try:
+            import matplotlib
+            matplotlib.use('Agg')  # クラウド環境でのバックエンドエラー防止
             import matplotlib.pyplot as plt
             import japanize_matplotlib
 
             cats_jp = ["身体", "頭", "心"]
             vals = [scores.get("body", 1.0), scores.get("brain", 1.0), scores.get("mental", 1.0)]
-            vals += vals[:1]
+            
+            # 閉じた多角形を作るために先頭データを末尾に追加（4要素にする）
+            vals_closed = vals + vals[:1]
+            
+            # 3方向（0度, 120度, 240度）の角度を設定し、終点も閉じる（4要素にする）
             angles = np.linspace(0, 2 * np.pi, 3, endpoint=False).tolist()
-            angles += angles[:1]
+            angles_closed = angles + angles[:1]
 
             fig, ax = plt.subplots(figsize=(4.5, 4.5), subplot_kw=dict(polar=True))
-            ax.plot(angles, vals, "o-", linewidth=2.5, color="#60a5fa", markersize=8)
-            ax.fill(angles, vals, alpha=0.3, color="#60a5fa")
-            ax.set_thetagrids(np.degrees(angles[:-1]), cats_jp, fontsize=12, color="#e5e7eb")
+            
+            # 描画には4要素の vals_closed / angles_closed を使用
+            ax.plot(angles_closed, vals_closed, "o-", linewidth=2.5, color="#60a5fa", markersize=8)
+            ax.fill(angles_closed, vals_closed, alpha=0.3, color="#60a5fa")
+            
+            # 軸ラベルの設定には元の3要素の angles と cats_jp を使用
+            ax.set_thetagrids(np.degrees(angles), cats_jp, fontsize=12, color="#e5e7eb")
+            
             ax.set_ylim(1, 5)
             ax.set_yticks([1, 2, 3, 4, 5])
             ax.set_yticklabels(["1", "2", "3", "4", "5"], color="#9ca3af", fontsize=9)
@@ -1213,16 +1224,19 @@ if st.session_state["analyzed"] and st.session_state["last_result"]:
             ax.set_facecolor("#1f2937")
             fig.patch.set_facecolor("#0e1117")
             ax.set_title("疲れ度レーダー（1〜5）", va="bottom", fontsize=13, color="#fafafa", pad=12)
+            
             st.pyplot(fig, use_container_width=False)
             plt.close(fig)
-        except Exception:
+            
+        except Exception as e:
+            # 万が一エラーが出た際に原因を確認できるようログ出し
+            logger.warning(f"Matplotlib render failed: {e}")
             chart_df = pd.DataFrame({
                 "カテゴリ": ["身体", "頭", "心"],
                 "疲れ度": [scores.get("body", 1.0), scores.get("brain", 1.0), scores.get("mental", 1.0)]
             }).set_index("カテゴリ")
             st.bar_chart(chart_df, height=240)
 
-        st.markdown("")  # 余白
 
         # ---- カテゴリー別コメント（3列カード） ----
         st.markdown("### カテゴリー別のコメント")
