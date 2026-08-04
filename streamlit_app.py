@@ -1193,7 +1193,7 @@ if st.session_state["analyzed"] and st.session_state["last_result"]:
         st.markdown("### 疲労度グラフ")
         try:
             import matplotlib.pyplot as plt
-			import japanize_matplotlib
+            import japanize_matplotlib
 
             cats_jp = ["身体", "頭", "心"]
             vals = [scores.get("body", 1.0), scores.get("brain", 1.0), scores.get("mental", 1.0)]
