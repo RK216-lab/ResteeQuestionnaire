@@ -1259,13 +1259,28 @@ if st.session_state["analyzed"] and st.session_state["last_result"]:
                 "疲れ度": [display_scores.get("body", 1.0), display_scores.get("brain", 1.0), display_scores.get("mental", 1.0)]
             }).set_index("カテゴリ")
             st.bar_chart(chart_df, height=240)
+            
+        # 横棒グラフ
+        import matplotlib.pyplot as plt
 
-        # スマホ・iPadでも見やすいように、念のためシンプル横バーも並列で追加（アドバイス反映）
-        chart_df_horizontal = pd.DataFrame({
-            "カテゴリ": ["身体", "頭", "心"],
-            "疲労度": [display_scores.get("body", 1.0), display_scores.get("brain", 1.0), display_scores.get("mental", 1.0)]
-        }).set_index("カテゴリ")
-        st.bar_chart(chart_df_horizontal, height=160, horizontal=True)
+        fig, ax = plt.subplots(figsize=(6, 2.5))
+
+        labels = ["身体", "頭", "心"]
+        values = [
+            display_scores.get("body", 1.0),
+            display_scores.get("brain", 1.0),
+            display_scores.get("mental", 1.0),
+        ]
+
+        ax.barh(labels, values)
+        ax.invert_yaxis()
+
+        ax.set_xlim(1, 5)
+        ax.set_xlabel("疲労度")
+        
+
+        st.pyplot(fig)
+        plt.close(fig)
 
         # ---- カテゴリー別コメント（3列カード） ----
         st.markdown("### カテゴリー別のコメント")
