@@ -431,6 +431,30 @@ def generate_sample_id(text: str, speech_rate: float, text_length: int, smile_fe
     content = f"{date_str}|{text}|{speech_rate:.3f}|{text_length}|{json.dumps(smile_sample, ensure_ascii=False, sort_keys=True)}|{choices}"
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
+def stretch_score_for_display(scores: Dict[str, float], gain: float = 3.0) -> Dict[str, float]:
+    """
+    保存・学習用の生のスコアを変えずに、画面表示用だけ1.0〜5.0へがっつりメリハリをつける関数。
+    gainが大きいほど少しの差で1.0や5.0に張り付きやすくなります（デフォルト: 3.0）
+    """
+    if not scores:
+        return {}
+    
+    # 3カテゴリの平均を基準（中心）にする
+    avg = sum(scores.values()) / len(scores)
+    
+    stretched = {}
+    for cat, val in scores.items():
+        diff = val - avg
+        # 差がない（完全平坦）場合は、全体的に3.0基準で中央値を少し補正
+        if abs(diff) < 1e-5:
+            stretched[cat] = round(float(np.clip((val - 2.5) * 2.0 + 3.0, 1.0, 5.0)), 1)
+        else:
+            # シグモイド関数を使って、わずかな差でも1.0〜5.0にガッツリ広げる
+            scaled = 1.0 + 4.0 / (1.0 + np.exp(-gain * diff))
+            stretched[cat] = round(float(scaled), 1)
+            
+    return stretched
+
 # -------------------------
 # 推論処理
 # -------------------------
@@ -906,7 +930,6 @@ def get_current_data_count() -> int:
         except Exception as e:
             logger.warning(f"HF count fetch failed: {e}")
 
-
     # HF失敗時だけlocal fallback
     try:
         if os.path.exists(DATA_PARQUET):
@@ -1001,7 +1024,9 @@ st.markdown("""
         padding: 16px 18px;
         margin-bottom: 12px;
         height: 100%;
+        min-height: 170px; /* ← 追加！ */
     }
+
     .report-card h4 {
         margin: 0 0 8px 0;
         color: #fafafa;
@@ -1021,6 +1046,7 @@ st.markdown("""
         border-radius: 12px;
         padding: 14px 16px;
         margin-bottom: 10px;
+        min-height: 110px; /* ← 追加！ */
     }
     .tip-card strong {
         color: #fafafa;
@@ -1155,30 +1181,34 @@ if st.session_state["analyzed"] and st.session_state["last_result"]:
     if not res.get("success", False):
         st.warning(f"{res.get('message', '')}")
     else:
-        scores = res.get("scores", {})
+        # ★③ 生データ（raw）と表示用データ（display）を明確に分離
+        raw_scores = res.get("scores", {})
+        display_scores = stretch_score_for_display(raw_scores, gain=8.0)
+        
         similarities = res.get("similarities", {})
         audio_feat = res.get("audio_feat", {})
         
-        fatigue_type = get_fatigue_type(scores)
-        summary = generate_summary_comment(scores)
+        # 判定やコメントは信頼性の高い raw_scores をベースにする
+        fatigue_type = get_fatigue_type(raw_scores)
+        summary = generate_summary_comment(raw_scores)  # ① summary の未定義エラーを解消！
         
         # ---- 疲れタイプ ----
         st.markdown(f"### あなたの疲れタイプ：**{fatigue_type}**")
         if summary:
             st.info(summary)
         
-        # ---- メトリクス（3列） ----
+        # ---- メトリクス（3列） ※表示は見栄えのいい display_scores を使用 ----
         col1, col2, col3 = st.columns(3)
         metrics = [
             ("💪 身体", "body"),
             ("🧠 頭", "brain"),
             ("💙 心", "mental"),
         ]
-        max_score = max(scores.values()) if scores else 1.0
-        avg_score = sum(scores.values()) / 3 if scores else 1.0
+        max_score = max(display_scores.values()) if display_scores else 1.0
+        avg_score = sum(display_scores.values()) / 3 if display_scores else 1.0
 
         for col, (label, cat) in zip([col1, col2, col3], metrics):
-            val = scores.get(cat, 1.0)
+            val = display_scores.get(cat, 1.0)
             fatigue_pct = float(np.clip((val - 1.0) / 4.0 * 100.0, 0.0, 100.0))
             delta_txt = f"疲労度 {fatigue_pct:.0f}%"
             if val == max_score and max_score - avg_score > 0.3:
@@ -1189,31 +1219,25 @@ if st.session_state["analyzed"] and st.session_state["last_result"]:
 
         st.markdown("")  # 余白
 
-        # ---- レーダーチャート / 棒グラフ ----
+        # ---- レーダーチャート ＆ グラフ調整（⑤ figsize=(5.8, 5.8)） ----
         st.markdown("### 疲労度グラフ")
         try:
             import matplotlib
-            matplotlib.use('Agg')  # クラウド環境でのバックエンドエラー防止
+            matplotlib.use('Agg')
             import matplotlib.pyplot as plt
-            import japanize_matplotlib
+            import japanize_matplotlib  # ④ requirements.txt に要追加
 
             cats_jp = ["身体", "頭", "心"]
-            vals = [scores.get("body", 1.0), scores.get("brain", 1.0), scores.get("mental", 1.0)]
+            vals = [display_scores.get("body", 1.0), display_scores.get("brain", 1.0), display_scores.get("mental", 1.0)]
             
-            # 閉じた多角形を作るために先頭データを末尾に追加（4要素にする）
             vals_closed = vals + vals[:1]
-            
-            # 3方向（0度, 120度, 240度）の角度を設定し、終点も閉じる（4要素にする）
             angles = np.linspace(0, 2 * np.pi, 3, endpoint=False).tolist()
             angles_closed = angles + angles[:1]
 
-            fig, ax = plt.subplots(figsize=(4.5, 4.5), subplot_kw=dict(polar=True))
+            fig, ax = plt.subplots(figsize=(5.8, 5.8), subplot_kw=dict(polar=True))
             
-            # 描画には4要素の vals_closed / angles_closed を使用
             ax.plot(angles_closed, vals_closed, "o-", linewidth=2.5, color="#60a5fa", markersize=8)
             ax.fill(angles_closed, vals_closed, alpha=0.3, color="#60a5fa")
-            
-            # 軸ラベルの設定には元の3要素の angles と cats_jp を使用
             ax.set_thetagrids(np.degrees(angles), cats_jp, fontsize=12, color="#e5e7eb")
             
             ax.set_ylim(1, 5)
@@ -1229,24 +1253,29 @@ if st.session_state["analyzed"] and st.session_state["last_result"]:
             plt.close(fig)
             
         except Exception as e:
-            # 万が一エラーが出た際に原因を確認できるようログ出し
             logger.warning(f"Matplotlib render failed: {e}")
             chart_df = pd.DataFrame({
                 "カテゴリ": ["身体", "頭", "心"],
-                "疲れ度": [scores.get("body", 1.0), scores.get("brain", 1.0), scores.get("mental", 1.0)]
+                "疲れ度": [display_scores.get("body", 1.0), display_scores.get("brain", 1.0), display_scores.get("mental", 1.0)]
             }).set_index("カテゴリ")
             st.bar_chart(chart_df, height=240)
 
+        # スマホ・iPadでも見やすいように、念のためシンプル横バーも並列で追加（アドバイス反映）
+        chart_df_horizontal = pd.DataFrame({
+            "カテゴリ": ["身体", "頭", "心"],
+            "疲労度": [display_scores.get("body", 1.0), display_scores.get("brain", 1.0), display_scores.get("mental", 1.0)]
+        }).set_index("カテゴリ")
+        st.bar_chart(chart_df_horizontal, height=160, horizontal=True)
 
         # ---- カテゴリー別コメント（3列カード） ----
         st.markdown("### カテゴリー別のコメント")
-        all_comments = generate_all_comments(scores)
+        all_comments = generate_all_comments(raw_scores)
         
         c1, c2, c3 = st.columns(3)
         comment_data = [
-            (c1, "💪 身体", "body", scores.get("body", 1.0)),
-            (c2, "🧠 頭", "brain", scores.get("brain", 1.0)),
-            (c3, "💙 心", "mental", scores.get("mental", 1.0)),
+            (c1, "💪 身体", "body", display_scores.get("body", 1.0)),
+            (c2, "🧠 頭", "brain", display_scores.get("brain", 1.0)),
+            (c3, "💙 心", "mental", display_scores.get("mental", 1.0)),
         ]
         for col, title, cat, val in comment_data:
             with col:
@@ -1262,9 +1291,8 @@ if st.session_state["analyzed"] and st.session_state["last_result"]:
 
         # ---- おすすめ休息提案（2×2カード） ----
         st.markdown("### 🌿 今日のおすすめ休息")
-        tips = generate_rest_suggestions(scores, fatigue_type)
+        tips = generate_rest_suggestions(raw_scores, fatigue_type)
         
-        # 2列レイアウトでカード表示
         for i in range(0, len(tips), 2):
             cols = st.columns(2)
             for j, tip in enumerate(tips[i:i+2]):
@@ -1278,7 +1306,7 @@ if st.session_state["analyzed"] and st.session_state["last_result"]:
 
         st.markdown("")  # 余白
 
-        # ---- 解析品質 ----
+        # ---- 解析品質（⑥ ⑥の良いネーミング） ----
         confidence_percent = res.get("confidence_percent", 20.0)
         st.markdown("---")
         st.caption(f"解析に利用できた情報量: **{confidence_percent:.0f}%**")
@@ -1286,11 +1314,12 @@ if st.session_state["analyzed"] and st.session_state["last_result"]:
         
         if DEBUG:
             with st.expander("🛠️ 解析の詳細データを見る"):
-                st.write("各スコア (1-5):", {k: f"{v:.1f}" for k, v in scores.items()})
+                st.write("生スコア (raw):", {k: f"{v:.1f}" for k, v in raw_scores.items()})
+                st.write("表示用スコア (display):", {k: f"{v:.1f}" for k, v in display_scores.items()})
                 st.write("オーディオ品質:", res.get("audio_quality", ""))
                 st.json(res.get("features", {}))
             
-        # ---- データ送信 ----
+        # ---- データ送信（② 学習用には raw_scores を使うように修正！） ----
         st.divider()
         st.subheader("🤝 開発へのご協力のお願い")
         st.markdown("""
@@ -1314,10 +1343,11 @@ if st.session_state["analyzed"] and st.session_state["last_result"]:
                     
                     audio_feat = res.get("audio_feat")
                     
+                    # ★② 加工前の raw_scores を保存するよう修正
                     save_msg = save_data_with_result_safe(
                         audio_feat=audio_feat,
                         query_emb=res.get("query_embedding"),
-                        pred_scores=scores,
+                        pred_scores=raw_scores,
                         similarities=res.get("similarities", {}),
                         questions=st.session_state["questions"],
                         choices=choices
